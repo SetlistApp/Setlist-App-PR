@@ -146,6 +146,17 @@ const BUILTIN_SECTION_DEFS = [
   { id: "recording", label: "Recordings", type: "linksList" },
   { id: "links", label: "Links", type: "linksList" }
 ];
+const SONG_DETAIL_TABS = ["overview", "chords", "attachments"];
+const SONG_DETAIL_TAB_LABELS = { overview: "Overview", chords: "Chords / Lyrics", attachments: "Attachments" };
+const SECTION_TAB_MAP = {
+  basicChords: "chords",
+  chordsLyrics: "chords",
+  recording: "attachments",
+  links: "attachments"
+};
+function sectionTab(id) {
+  return SECTION_TAB_MAP[id] || "overview";
+}
 const DOT_COLORS = [
   { id: "auto", label: "Auto", value: null },
   { id: "ready", label: "Ready", value: "#4fae7a" },
@@ -395,7 +406,19 @@ function useArmedDelete() {
   return [armedId, handleDeleteClick];
 }
 function forceFullReload() {
-  window.location.reload();
+  if ("caches" in window) {
+    caches.keys().then(function(keys) {
+      return Promise.all(keys.map(function(k) {
+        return caches.delete(k);
+      }));
+    }).then(function() {
+      window.location.reload();
+    }).catch(function() {
+      window.location.reload();
+    });
+  } else {
+    window.location.reload();
+  }
 }
 function stableStringify(value) {
   if (Array.isArray(value)) {
@@ -487,7 +510,7 @@ function nextRetryDelay(attempt) {
   const base = Math.min(RETRY_DELAY_MS * Math.pow(2, n), RETRY_MAX_DELAY_MS);
   return base + Math.floor(Math.random() * 3e3);
 }
-const APP_VERSION = "2.0";
+const APP_VERSION = "2.0.2";
 var _useSupabaseData = typeof window !== "undefined" && !!window.__SUPABASE_DATA__;
 var _realtimeStatus = "not configured";
 function versionBase(v) {
@@ -1351,7 +1374,7 @@ function App() {
         }
         setSaveState(data.offline ? "offline" : "idle");
         setSyncStatus(data.offline ? "error" : "synced");
-        if (!data.offline && data.version && data.version !== APP_VERSION) {
+        if (!data.offline && data.version && versionBase(data.version) !== versionBase(APP_VERSION)) {
           setNewVersionAvailable(true);
         }
         if (!usedCache) {
@@ -1422,7 +1445,7 @@ function App() {
     try {
       const data = await loadAllData(true, isManual ? null : dataVersionRef.current);
       if (data.noChange) {
-        if (data.version && data.version !== APP_VERSION) setNewVersionAvailable(true);
+        if (data.version && versionBase(data.version) !== versionBase(APP_VERSION)) setNewVersionAvailable(true);
         if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
         reportSyncSuccess();
         setSyncStatus("synced");
@@ -1467,7 +1490,7 @@ function App() {
       );
       setSectionDefs(data.sectionDefs);
       setViews((prev) => data.views && Object.keys(data.views).length ? data.views : prev);
-      if (!data.offline && data.version && data.version !== APP_VERSION) {
+      if (!data.offline && data.version && versionBase(data.version) !== versionBase(APP_VERSION)) {
         setNewVersionAvailable(true);
       }
       if (data.offline) {
@@ -2020,6 +2043,38 @@ function App() {
             applied: scanResult.applied || 0,
             alreadyLinked: scanResult.alreadyLinked || 0
           });
+          if (_useSupabaseData && scanResult.allSongRecordings && scanResult.allSongRecordings.length > 0) {
+            const client = getSupabaseClient();
+            for (const entry of scanResult.allSongRecordings) {
+              try {
+                const cur = await client.from("songs").select("recording").eq("id", entry.id).single();
+                const supaRecs = cur.data && cur.data.recording || [];
+                const sheetRecs = entry.recording || [];
+                const existingIds = /* @__PURE__ */ new Set();
+                for (const r of supaRecs) {
+                  const fid = driveFileIdFromUrl(r.url);
+                  if (fid) existingIds.add(fid);
+                }
+                let merged = [...supaRecs];
+                let added = 0;
+                for (const r of sheetRecs) {
+                  const fid = driveFileIdFromUrl(r.url);
+                  if (fid && existingIds.has(fid)) continue;
+                  if (!fid && supaRecs.some((s) => s.url === r.url)) continue;
+                  merged.push(r);
+                  added++;
+                }
+                if (added > 0) {
+                  await supabaseCall(
+                    "driveScanSync",
+                    () => saveSongPatchToSupabase({ id: entry.id, recording: merged })
+                  );
+                }
+              } catch (e) {
+                console.warn("Failed to sync recordings to Supabase:", entry.id, e);
+              }
+            }
+          }
           refreshAllData(false);
         } else {
           alert("No Drive folder is saved yet \u2014 open Drive folder settings and save the folder link again.");
@@ -2981,7 +3036,7 @@ function Metronome({ bpm, onSetBpm }) {
     "+"
   ), /* @__PURE__ */ React.createElement("button", { type: "button", style: styles.metroTap, onClick: handleTap }, "Tap")), /* @__PURE__ */ React.createElement("div", { style: styles.metroHint }, hint));
 }
-function LinksListEditor({ value, onChange, onFieldBlur, songId, songTitle }) {
+function LinksListEditor({ value, onChange, onFieldBlur, songId, songTitle, hideAddLink, hideInternalButtons }) {
   const links = value || [];
   const byId = useMemo(() => Object.fromEntries(links.map((l) => [l.id, l])), [links]);
   const [localOrder, setLocalOrder] = useState(links.map((l) => l.id));
@@ -3104,7 +3159,7 @@ function LinksListEditor({ value, onChange, onFieldBlur, songId, songTitle }) {
       delBusyId === id ? "Deleting\u2026" : delConfirmId === id ? "Tap again \u2014 move the file to Drive trash" : "Delete file",
       delConfirmId !== id && delBusyId !== id && /* @__PURE__ */ React.createElement("span", { style: styles.linkDelMenuSub }, "recoverable ~30 days")
     ), delErr && /* @__PURE__ */ React.createElement("div", { style: styles.uploadErrText }, delErr), /* @__PURE__ */ React.createElement("button", { onClick: closeDelMenu, style: styles.linkDelMenuBtn, disabled: delBusyId === id }, "Cancel")));
-  }), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } }, /* @__PURE__ */ React.createElement("button", { onClick: addLink, style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13 }), " Add link"), songId && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowAddAudio(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13 }), " Add audio"), songId && CAN_RECORD && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowRecord(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "mic", size: 13 }), " Record")), showAddAudio && /* @__PURE__ */ React.createElement(
+  }), !hideInternalButtons && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, flexWrap: "wrap" } }, !hideAddLink && /* @__PURE__ */ React.createElement("button", { onClick: addLink, style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13 }), " Add link"), songId && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowAddAudio(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13 }), " Add audio"), songId && CAN_RECORD && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowRecord(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "mic", size: 13 }), " Record")), showAddAudio && /* @__PURE__ */ React.createElement(
     AddRecordingSheet,
     {
       songId,
@@ -4181,6 +4236,9 @@ function SongDetail({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showZoomControl, setShowZoomControl] = useState(false);
   const [linksEditModeFor, setLinksEditModeFor] = useState(null);
+  const [showAddAudio, setShowAddAudio] = useState(false);
+  const [showRecord, setShowRecord] = useState(false);
+  const [activeTab, setActiveTab] = useState("overview");
   const [collapsed, setCollapsed] = useState(() => restoreCollapsed || defaultCollapsedState(song, sectionDefsById));
   const detailScrollElRef = useRef(null);
   useEffect(() => {
@@ -4221,6 +4279,7 @@ function SongDetail({
     setShowMetaMenu(false);
     setShowDotPicker(false);
     setLinksEditModeFor(null);
+    setActiveTab("overview");
     if (!skippedInitialCollapseReset.current && restoreCollapsed) {
       skippedInitialCollapseReset.current = true;
     } else {
@@ -4336,7 +4395,7 @@ function SongDetail({
         },
         style: styles.sectionMenuItem
       },
-      linksEditModeFor === id ? "Done editing links" : "Edit links"
+      linksEditModeFor === id ? def.id === "recording" ? "Done editing recordings" : "Done editing links" : def.id === "recording" ? "Edit recordings" : "Edit links"
     ), /* @__PURE__ */ React.createElement(
       "button",
       {
@@ -4437,12 +4496,26 @@ function SongDetail({
       },
       "Zoom"
     ), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete(true), style: { ...styles.sectionMenuItem, color: "var(--needs)" } }, "Delete song")))))),
-    /* @__PURE__ */ React.createElement("div", { ref: detailScrollElRef, onScroll: handleDetailScroll, style: styles.detailScroll }, /* @__PURE__ */ React.createElement("div", { style: styles.atomicList }, displayOrder.map((id, _idx) => {
+    /* @__PURE__ */ React.createElement("div", { style: styles.songTabBar }, SONG_DETAIL_TABS.map((t) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: t,
+        onClick: () => {
+          setActiveTab(t);
+          if (detailScrollElRef.current) detailScrollElRef.current.scrollTop = 0;
+        },
+        style: { ...styles.songTabBtn, ...activeTab === t ? styles.songTabBtnActive : {} }
+      },
+      SONG_DETAIL_TAB_LABELS[t]
+    ))),
+    /* @__PURE__ */ React.createElement("div", { ref: detailScrollElRef, onScroll: handleDetailScroll, style: styles.detailScroll }, /* @__PURE__ */ React.createElement("div", { style: styles.atomicList }, displayOrder.filter((id) => sectionTab(id) === activeTab).map((id, _idx, filteredArr) => {
       const def = sectionDefsById[id];
       if (!def) return null;
       const hasData = sectionHasData(def, song);
       const isEmpty = emptyIds.has(id);
-      const showEmptyDivider = _idx === firstEmptyIdx && hasFilledSections && firstEmptyIdx > 0;
+      const tabFirstEmptyIdx = filteredArr.findIndex((fid) => emptyIds.has(fid));
+      const tabHasFilled = filteredArr.some((fid) => !emptyIds.has(fid));
+      const showEmptyDivider = activeTab === "overview" && _idx === tabFirstEmptyIdx && tabHasFilled && tabFirstEmptyIdx > 0;
       const isLinksList = def.type === "linksList";
       const isTodoList = def.type === "todoList";
       const todoArrForInline = isTodoList ? song[def.id] || [] : null;
@@ -4498,6 +4571,23 @@ function SongDetail({
       if (isLinksList) {
         const linksArr = song[def.id] || [];
         const editingThisLinks = linksEditModeFor === id;
+        const isRecording = def.id === "recording";
+        if (activeTab === "attachments") {
+          return /* @__PURE__ */ React.createElement(React.Fragment, { key: id }, emptyDividerEl, /* @__PURE__ */ React.createElement("div", { ref: setRowRef(id), style: { ...styles.attachSection, ...activeDragId === id ? styles.dragging : {} } }, /* @__PURE__ */ React.createElement("div", { style: styles.attachSectionHeader }, sectionEditMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startDrag(id), style: { ...styles.atomicDragHandle, marginTop: 0 }, "data-swipe-ignore": "true" }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 15, color: "var(--dim)" })), /* @__PURE__ */ React.createElement("span", { style: { ...styles.atomicLabel, flex: 1 } }, def.label), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setOpenMenuFor((cur) => cur === id ? null : id), style: styles.atomicMenuBtn, "aria-label": "Section options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 15, color: "var(--dim)" })), renderMenu(id, def))), editingThisLinks && /* @__PURE__ */ React.createElement("div", { style: { padding: "0 4px 8px" } }, /* @__PURE__ */ React.createElement(
+            LinksListEditor,
+            {
+              value: linksArr,
+              onChange: (next) => onChange({ [def.id]: next }),
+              onFieldBlur,
+              songId: isRecording ? song.id : void 0,
+              songTitle: isRecording ? song.title : void 0,
+              hideAddLink: isRecording,
+              hideInternalButtons: true
+            }
+          )), !editingThisLinks && linksArr.length > 0 && /* @__PURE__ */ React.createElement("div", { style: styles.attachList }, linksArr.map((l) => /* @__PURE__ */ React.createElement("a", { key: l.id, href: l.url, target: "_blank", rel: "noopener noreferrer", style: styles.attachItem }, /* @__PURE__ */ React.createElement("div", { style: styles.attachItemIcon }, /* @__PURE__ */ React.createElement(Icon, { name: isRecording ? "mic" : "externalLink", size: 14, color: "var(--gold)" })), /* @__PURE__ */ React.createElement("div", { style: styles.attachItemText }, /* @__PURE__ */ React.createElement("div", { style: styles.attachItemName }, l.name || l.url)), /* @__PURE__ */ React.createElement(Icon, { name: "chevronRight", size: 14, color: "var(--dim)" })))), /* @__PURE__ */ React.createElement("div", { style: styles.attachActionBtns }, isRecording && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowAddAudio(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13, color: "var(--dim)" }), " Add audio"), CAN_RECORD && /* @__PURE__ */ React.createElement("button", { onClick: () => setShowRecord(true), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "mic", size: 13, color: "var(--dim)" }), " Record"), /* @__PURE__ */ React.createElement("button", { onClick: () => setLinksEditModeFor(editingThisLinks ? null : id), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "pencil", size: 13, color: "var(--dim)" }), " ", editingThisLinks ? "Done editing recordings" : "Edit recordings")), !isRecording && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { onClick: () => {
+            setLinksEditModeFor(id);
+          }, style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 13, color: "var(--dim)" }), " Add link"), /* @__PURE__ */ React.createElement("button", { onClick: () => setLinksEditModeFor(editingThisLinks ? null : id), style: styles.arrAddBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "pencil", size: 13, color: "var(--dim)" }), " ", editingThisLinks ? "Done editing links" : "Edit links")))));
+        }
         return /* @__PURE__ */ React.createElement(React.Fragment, { key: id }, emptyDividerEl, /* @__PURE__ */ React.createElement("div", { ref: setRowRef(id), style: { ...styles.atomicInlineRow, alignItems: "flex-start", ...openMenuFor === id ? { position: "relative", zIndex: 25 } : {}, ...activeDragId === id ? styles.dragging : {} } }, sectionEditMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startDrag(id), style: { ...styles.atomicDragHandle, marginTop: 4 }, "data-swipe-ignore": "true" }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 15, color: "var(--dim)" })), renamingSectionId === id ? /* @__PURE__ */ React.createElement(
           "input",
           {
@@ -4589,7 +4679,7 @@ function SongDetail({
           style: styles.sectionRenameInput
         }
       )) : /* @__PURE__ */ React.createElement("button", { onClick: () => setCollapsed((p) => ({ ...p, [id]: !p[id] })), style: styles.atomicToggle }, isCollapsed ? /* @__PURE__ */ React.createElement(Icon, { name: "chevronRight", size: 16, color: "var(--dim)" }) : /* @__PURE__ */ React.createElement(Icon, { name: "chevronDown", size: 16, color: "var(--dim)" }), /* @__PURE__ */ React.createElement("span", { style: { ...styles.atomicLabel, ...!hasData ? styles.atomicLabelEmpty : {} } }, def.label), previewText && /* @__PURE__ */ React.createElement("span", { style: styles.sectionPreview }, previewText)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setOpenMenuFor((cur) => cur === id ? null : id), style: styles.atomicMenuBtn, "aria-label": "Section options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 15, color: "var(--dim)" })), renderMenu(id, def))), !isCollapsed && /* @__PURE__ */ React.createElement("div", { style: { ...styles.atomicContent, paddingLeft: sectionEditMode ? 25 : 4 } }, renderSectionContent(def, song, onChange, arrColPct, onArrColPctChange, arrEditMode, onFieldBlur))));
-    })), hiddenSections.length > 0 && /* @__PURE__ */ React.createElement("div", { style: styles.addSectionWrap }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowHidden((v) => !v), style: styles.addSectionBtn }, showHidden ? "Hide list" : `Show hidden sections (${hiddenSections.length})`), showHidden && /* @__PURE__ */ React.createElement("div", { style: styles.hiddenChipRow }, hiddenSections.map((id) => /* @__PURE__ */ React.createElement("button", { key: id, onClick: () => onShowSection(id), style: styles.hiddenChip }, "+ ", sectionDefsById[id]?.label))))),
+    })), hiddenSections.length > 0 && activeTab === "overview" && /* @__PURE__ */ React.createElement("div", { style: styles.addSectionWrap }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowHidden((v) => !v), style: styles.addSectionBtn }, showHidden ? "Hide list" : `Show hidden sections (${hiddenSections.length})`), showHidden && /* @__PURE__ */ React.createElement("div", { style: styles.hiddenChipRow }, hiddenSections.map((id) => /* @__PURE__ */ React.createElement("button", { key: id, onClick: () => onShowSection(id), style: styles.hiddenChip }, "+ ", sectionDefsById[id]?.label))))),
     showAddSection && /* @__PURE__ */ React.createElement(
       AddSectionModal,
       {
@@ -4601,6 +4691,35 @@ function SongDetail({
       }
     ),
     showZoomControl && /* @__PURE__ */ React.createElement(ZoomControl, { onBeforeReload, onClose: () => setShowZoomControl(false) }),
+    showAddAudio && /* @__PURE__ */ React.createElement(
+      AddRecordingSheet,
+      {
+        songId: song.id,
+        songTitle: song.title,
+        onClose: () => setShowAddAudio(false),
+        onUploaded: (link) => {
+          onChange({ recording: [...song.recording || [], link] });
+          setShowAddAudio(false);
+        }
+      }
+    ),
+    showRecord && /* @__PURE__ */ React.createElement(
+      RecordSheet,
+      {
+        songId: song.id,
+        songTitle: song.title,
+        existingNames: (song.recording || []).map((l) => l.name),
+        onClose: () => setShowRecord(false),
+        onChooseFile: () => {
+          setShowRecord(false);
+          setShowAddAudio(true);
+        },
+        onUploaded: (link) => {
+          onChange({ recording: [...song.recording || [], link] });
+          setShowRecord(false);
+        }
+      }
+    ),
     /* @__PURE__ */ React.createElement("div", { style: styles.navFooter }, /* @__PURE__ */ React.createElement("button", { disabled: !prevId, onClick: () => prevId && onNavigate(prevId), style: { ...styles.navBtn, ...!prevId ? styles.navBtnDisabled : {} } }, /* @__PURE__ */ React.createElement(Icon, { name: "chevronLeft", size: 16 }), " Previous"), /* @__PURE__ */ React.createElement("button", { disabled: !nextId, onClick: () => nextId && onNavigate(nextId), style: { ...styles.navBtn, ...!nextId ? styles.navBtnDisabled : {} } }, "Next ", /* @__PURE__ */ React.createElement(Icon, { name: "chevronRight", size: 16 })))
   );
 }
@@ -4801,6 +4920,20 @@ const rawStyles = {
   textarea: { width: "100%", background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 8, padding: "7px 8px", color: "var(--text)", fontSize: 16, lineHeight: 1.5, resize: "vertical" },
   linkChipZone: { flex: 1, minWidth: 0, display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 8 },
   linkChip: { display: "flex", alignItems: "center", gap: 6, background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 20, padding: "7px 14px", fontSize: 13, color: "var(--gold)", textDecoration: "none" },
+  // Song detail tab bar
+  songTabBar: { display: "flex", flexShrink: 0, borderBottom: "1px solid var(--line)", padding: "0 14px", gap: 0 },
+  songTabBtn: { flex: 1, background: "none", border: "none", borderBottom: "2px solid transparent", color: "var(--dim)", fontFamily: "var(--display)", fontWeight: 500, fontSize: 13.5, letterSpacing: "0.04em", textTransform: "uppercase", padding: "10px 4px 8px", cursor: "pointer", textAlign: "center" },
+  songTabBtnActive: { color: "var(--gold)", borderBottomColor: "var(--gold)" },
+  // Attachments tab styles
+  attachSection: { borderBottom: "1px solid var(--line)", padding: "0 14px" },
+  attachSectionHeader: { display: "flex", alignItems: "center", gap: 5, padding: "9px 0" },
+  attachList: { display: "flex", flexDirection: "column", gap: 0 },
+  attachItem: { display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: "1px solid var(--line)", textDecoration: "none", cursor: "pointer" },
+  attachItemIcon: { width: 32, height: 32, borderRadius: 7, background: "var(--surface)", border: "1px solid var(--line)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  attachItemText: { flex: 1, minWidth: 0 },
+  attachItemName: { fontFamily: "var(--body)", fontSize: 14, color: "var(--text)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  attachActionBtns: { display: "flex", gap: 8, flexWrap: "wrap", padding: "8px 0 12px" },
+  attachActionBtn: { display: "flex", alignItems: "center", gap: 5, background: "none", border: "1px dashed var(--line)", borderRadius: 7, padding: "7px 12px", color: "var(--dim)", fontFamily: "var(--body)", fontSize: 13, cursor: "pointer" },
   linksEditList: { display: "flex", flexDirection: "column", gap: 5 },
   linksEditRow: { background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 8, padding: "6px 8px" },
   linksEditRowTop: { display: "flex", alignItems: "center", gap: 7, marginBottom: 4 },
@@ -4844,7 +4977,7 @@ const rawStyles = {
   todoCompletedLabel: { fontSize: 10, textTransform: "uppercase", letterSpacing: "0.12em", color: "var(--dim)", fontFamily: "var(--display)", fontWeight: 600, padding: "2px 2px 6px" },
   todoAddBtn: { display: "flex", alignItems: "center", gap: 6, justifyContent: "center", background: "none", border: "1px dashed var(--line)", color: "var(--dim)", borderRadius: 7, padding: "9px 12px", fontSize: 13, cursor: "pointer", marginTop: 6, width: "100%" },
   todoInlineAddBtn: { display: "flex", alignItems: "center", gap: 5, background: "none", border: "1px dashed var(--line)", color: "var(--dim)", borderRadius: 6, padding: "5px 10px", fontSize: 12.5, cursor: "pointer" },
-  todoScreenOverlay: { position: "absolute", inset: 0, background: "var(--bg)", display: "flex", flexDirection: "column", touchAction: "pan-y" },
+  todoScreenOverlay: { position: "absolute", inset: 0, background: "var(--bg)", display: "flex", flexDirection: "column", touchAction: "pan-y", zIndex: 40 },
   todoScreenHeader: { display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderBottom: "1px solid var(--line)" },
   todoScreenBack: { background: "none", border: "none", display: "flex", padding: 4 },
   todoScreenTitle: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 17, color: "var(--text)" },
