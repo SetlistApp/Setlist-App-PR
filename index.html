@@ -474,55 +474,93 @@ const RELOAD_SNAPSHOT_KEY = "bandSetlist_reloadSnapshot";
 const RELOAD_SNAPSHOT_MAX_AGE_MS = 6e4;
 const RETRY_DELAY_MS = 12e3;
 const RETRY_MAX_DELAY_MS = 6e4;
-const AUTO_REFRESH_INTERVAL_MS = 1e4;
-const EDIT_IDLE_SAVE_MS = 2500;
+const AUTO_REFRESH_INTERVAL_MS = 7e3;
+const EDIT_IDLE_SAVE_MS = 1500;
+const POST_SAVE_SYNC_COOLDOWN_MS = 3e3;
+const CONFIRMED_PATCH_TTL_MS = 1e4;
 function nextRetryDelay(attempt) {
   const n = Math.max(0, (attempt || 1) - 1);
   const base = Math.min(RETRY_DELAY_MS * Math.pow(2, n), RETRY_MAX_DELAY_MS);
   return base + Math.floor(Math.random() * 3e3);
 }
-const APP_VERSION = "1.7.3.2";
+const APP_VERSION = "1.7.3.7";
 function versionBase(v) {
   return String(v || "").split("-")[0].split(".").slice(0, 3).join(".");
 }
-const GS_SAVE_TIMEOUT_MS = 25e3;
+const GS_SAVE_TIMEOUT_MS = 3e4;
 const GS_CALL_TIMEOUT_MS = 14e3;
 const GS_CALL_SYNC_TIMEOUT_MS = 14e3;
 const FETCH_TRANSPORT_EXTRA_MS = 3e4;
 const GAS_DOPOST_URL = "https://script.google.com/macros/s/AKfycbw-JuS02Bqwm1rav03CtJ2TVdx1QVHDUS6MUjPBlUO_mOog8B-tQOHqsLAgXxejHsB8gg/exec";
+const GSCALL_MAX_RETRIES = 2;
+const GSCALL_RETRY_DELAY_MS = 2e3;
+const DIAG_LOG_MAX = 30;
+const _diagLog = [];
+function diagLog(entry) {
+  _diagLog.push(entry);
+  if (_diagLog.length > DIAG_LOG_MAX) _diagLog.shift();
+}
+function getDiagLog() {
+  return _diagLog;
+}
 function gsCall(fnName, arg, timeoutMs) {
-  const effectiveTimeout = (timeoutMs || GS_CALL_TIMEOUT_MS) + FETCH_TRANSPORT_EXTRA_MS;
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      controller.abort();
-      reject(new Error(fnName + " timed out after " + effectiveTimeout + "ms"));
-    }, effectiveTimeout);
-    const dopostUrl = typeof window.__DOPOST_URL__ === "string" && window.__DOPOST_URL__ ? window.__DOPOST_URL__ : GAS_DOPOST_URL;
-    fetch(dopostUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ fn: fnName, arg }),
-      signal: controller.signal
-    }).then((res) => {
-      if (!res.ok) throw new Error(fnName + " failed: HTTP " + res.status);
-      return res.json();
-    }).then((envelope) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      if (envelope && envelope.ok) resolve(envelope.result);
-      else reject(new Error(envelope && envelope.error && envelope.error.message || fnName + " failed"));
-    }).catch((err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutId);
-      reject(err instanceof Error ? err : new Error(String(err)));
+  const perAttemptTimeout = (timeoutMs || GS_CALL_TIMEOUT_MS) + FETCH_TRANSPORT_EXTRA_MS;
+  const dopostUrl = typeof window.__DOPOST_URL__ === "string" && window.__DOPOST_URL__ ? window.__DOPOST_URL__ : GAS_DOPOST_URL;
+  const bodyStr = JSON.stringify({ fn: fnName, arg });
+  function attempt(retriesLeft) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        controller.abort();
+        reject(new Error(fnName + " timed out after " + perAttemptTimeout + "ms"));
+      }, perAttemptTimeout);
+      fetch(dopostUrl, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: bodyStr,
+        signal: controller.signal
+      }).then((res) => {
+        if (!res.ok) throw new Error(fnName + " failed: HTTP " + res.status);
+        return res.json();
+      }).then((envelope) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        if (envelope && envelope.ok) resolve(envelope.result);
+        else reject(new Error(envelope && envelope.error && envelope.error.message || fnName + " failed"));
+      }).catch((err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeoutId);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      });
     });
-  });
+  }
+  function run(retriesLeft) {
+    return attempt(retriesLeft).catch((err) => {
+      const msg = err && err.message;
+      if (msg && !msg.includes("timed out") && !msg.includes("HTTP ") && !msg.includes("Failed to fetch") && !msg.includes("NetworkError") && !msg.includes("AbortError") && !msg.includes("JSON")) {
+        throw err;
+      }
+      if (retriesLeft <= 0) throw err;
+      console.warn(fnName + " transient error, " + retriesLeft + " retries left:", msg);
+      return new Promise((r) => setTimeout(r, GSCALL_RETRY_DELAY_MS)).then(() => run(retriesLeft - 1));
+    });
+  }
+  const t0 = Date.now();
+  return run(GSCALL_MAX_RETRIES).then(
+    (result) => {
+      diagLog({ fn: fnName, ok: true, ms: Date.now() - t0, err: null, at: (/* @__PURE__ */ new Date()).toISOString(), retries: GSCALL_MAX_RETRIES });
+      return result;
+    },
+    (err) => {
+      diagLog({ fn: fnName, ok: false, ms: Date.now() - t0, err: err && err.message || String(err), at: (/* @__PURE__ */ new Date()).toISOString(), retries: GSCALL_MAX_RETRIES });
+      throw err;
+    }
+  );
 }
 function loadPersonalPrefs() {
   let activeViewId = null;
@@ -558,9 +596,13 @@ function savePersonalArrColPct(n) {
   } catch (e) {
   }
 }
-async function loadAllData(fastTimeout) {
+async function loadAllData(fastTimeout, sinceVersion) {
   try {
-    const data = await gsCall("getAllData", void 0, fastTimeout ? GS_CALL_SYNC_TIMEOUT_MS : void 0);
+    const arg = sinceVersion != null ? { sinceVersion } : void 0;
+    const data = await gsCall("getAllData", arg, fastTimeout ? GS_CALL_SYNC_TIMEOUT_MS : void 0);
+    if (data && data.noChange) {
+      return { noChange: true, dataVersion: data.dataVersion, version: data.version, offline: false };
+    }
     if (!data || !Array.isArray(data.songs)) {
       throw new Error("getAllData returned an unusable payload");
     }
@@ -722,6 +764,8 @@ function App() {
   const saveFailureStreak = useRef(0);
   const SAVE_OFFLINE_THRESHOLD = 2;
   const [lastSaveError, setLastSaveError] = useState(null);
+  const lastSaveSuccessAt = useRef(0);
+  const dataVersionRef = useRef(null);
   function reportSaveFailure(err) {
     saveFailureStreak.current += 1;
     if (err) {
@@ -735,6 +779,7 @@ function App() {
   }
   function reportSaveSuccess() {
     saveFailureStreak.current = 0;
+    lastSaveSuccessAt.current = Date.now();
     setSaveState("saved");
     if (syncStatusRef.current === "error") {
       syncFailureStreak.current = 0;
@@ -781,13 +826,22 @@ function App() {
   const viewsRetryTimer = useRef(null);
   const viewsSavePending = useRef(false);
   const viewsRetryCount = useRef(0);
+  const recentlyConfirmedPatches = useRef({});
   const songSaveTimers = useRef({});
   function attemptSongSaveFor(id) {
     const entry = songSaveTimers.current[id];
     if (!entry || !entry.pendingPatch) return;
-    if (entry.inFlight) return;
+    if (entry.inFlight) {
+      const staleMs = (GS_SAVE_TIMEOUT_MS + FETCH_TRANSPORT_EXTRA_MS) * 1.5;
+      if (entry.inFlightSince && Date.now() - entry.inFlightSince > staleMs) {
+        console.warn("Force-clearing stale inFlight for song", id);
+        songSaveTimers.current[id] = { ...entry, inFlight: false, inFlightSince: null };
+      } else {
+        return;
+      }
+    }
     const patchBeingSaved = entry.pendingPatch;
-    songSaveTimers.current[id] = { ...entry, inFlight: true };
+    songSaveTimers.current[id] = { ...entry, inFlight: true, inFlightSince: Date.now() };
     setSaveState("saving");
     saveOneSongRemote(patchBeingSaved).then(() => {
       reportSaveSuccess();
@@ -795,6 +849,7 @@ function App() {
       if (!current) return;
       if (current.pendingPatch === patchBeingSaved) {
         songSaveTimers.current[id] = { ...current, pendingPatch: null, retry: null, retryCount: 0, inFlight: false };
+        recentlyConfirmedPatches.current[id] = { patch: patchBeingSaved, at: Date.now() };
       } else {
         songSaveTimers.current[id] = { ...current, retryCount: 0, inFlight: false };
         attemptSongSaveFor(id);
@@ -906,6 +961,7 @@ function App() {
         entry.retry = setTimeout(attempt, nextRetryDelay(attempts));
       });
     }
+    entry.attemptFn = attempt;
     entry.debounce = setTimeout(attempt, 350);
   }
   function scheduleSetlistSave(setlist) {
@@ -984,11 +1040,19 @@ function App() {
       try {
         const data = await loadAllData();
         if (cancelled) return;
+        if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
         setIsBeta(!!data.isBeta);
         if (usedCache) {
+          const initNow = Date.now();
           const merged = data.songs.map((s) => {
+            let m = s;
+            const confirmed = recentlyConfirmedPatches.current[s.id];
+            if (confirmed && initNow - confirmed.at < CONFIRMED_PATCH_TTL_MS) {
+              m = { ...m, ...confirmed.patch };
+            }
             const t = songSaveTimers.current[s.id];
-            return t && t.pendingPatch ? { ...s, ...t.pendingPatch } : s;
+            if (t && t.pendingPatch) m = { ...m, ...t.pendingPatch };
+            return m;
           });
           setSongs(merged);
         } else {
@@ -1075,33 +1139,57 @@ function App() {
   function hasPendingWork() {
     for (const id in songSaveTimers.current) {
       const t = songSaveTimers.current[id];
-      if (t && t.pendingPatch) return true;
+      if (t && (t.pendingPatch || t.inFlight)) return true;
     }
     if (orderSavePending.current) return true;
     if (setlistSavePending.current) return true;
     if (defsSavePending.current) return true;
     if (viewsSavePending.current) return true;
+    if (lastSaveSuccessAt.current && Date.now() - lastSaveSuccessAt.current < POST_SAVE_SYNC_COOLDOWN_MS) return true;
     return false;
   }
   async function refreshAllData(isManual) {
-    if (refreshing) return;
+    if (refreshingRef.current) return;
     if (hasPendingWork()) {
       setSyncStatus("paused");
       return;
     }
+    refreshingRef.current = true;
     setRefreshing(true);
     if (isManual) setManualRefreshing(true);
     try {
-      const data = await loadAllData(true);
+      const data = await loadAllData(true, isManual ? null : dataVersionRef.current);
+      if (data.noChange) {
+        if (data.version && data.version !== APP_VERSION) setNewVersionAvailable(true);
+        if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
+        reportSyncSuccess();
+        setSyncStatus("synced");
+        refreshingRef.current = false;
+        setRefreshing(false);
+        if (isManual) setManualRefreshing(false);
+        retryAllPendingSaves();
+        return;
+      }
+      if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
       if (hasPendingWork()) {
         setSyncStatus("paused");
+        refreshingRef.current = false;
         setRefreshing(false);
         if (isManual) setManualRefreshing(false);
         return;
       }
+      const now = Date.now();
       const songsWithPendingApplied = data.songs.map((s) => {
+        let merged = s;
+        const confirmed = recentlyConfirmedPatches.current[s.id];
+        if (confirmed && now - confirmed.at < CONFIRMED_PATCH_TTL_MS) {
+          merged = { ...merged, ...confirmed.patch };
+        } else if (confirmed) {
+          delete recentlyConfirmedPatches.current[s.id];
+        }
         const t = songSaveTimers.current[s.id];
-        return t && t.pendingPatch ? { ...s, ...t.pendingPatch } : s;
+        if (t && t.pendingPatch) merged = { ...merged, ...t.pendingPatch };
+        return merged;
       });
       const nextSetlists = Array.isArray(data.setlists) ? data.setlists : [];
       const nextDefaultId = data.defaultSetlistId && nextSetlists.some((sl) => sl.id === data.defaultSetlistId) ? data.defaultSetlistId : null;
@@ -1137,6 +1225,7 @@ function App() {
       console.error("refresh failed", err);
       reportSyncFailure();
     }
+    refreshingRef.current = false;
     setRefreshing(false);
     if (isManual) setManualRefreshing(false);
   }
@@ -1187,10 +1276,39 @@ function App() {
   function retryAllPendingSaves() {
     for (const id in songSaveTimers.current) {
       const entry = songSaveTimers.current[id];
-      if (entry && entry.retry) {
+      if (!entry) continue;
+      if (entry.retry) {
         clearTimeout(entry.retry);
         songSaveTimers.current[id] = { ...entry, retry: null };
         attemptSongSaveFor(id);
+      } else if (entry.pendingPatch && entry.inFlight) {
+        attemptSongSaveFor(id);
+      } else if (entry.pendingPatch && !entry.inFlight) {
+        if (entry.debounce) clearTimeout(entry.debounce);
+        songSaveTimers.current[id] = { ...entry, debounce: null };
+        attemptSongSaveFor(id);
+      }
+    }
+    if (orderRetryTimer.current) {
+      clearTimeout(orderRetryTimer.current);
+      orderRetryTimer.current = null;
+      if (orderSavePending.current && latestOrderRef.current) {
+        setSaveState("saving");
+        saveSongOrderRemote(latestOrderRef.current).then(() => {
+          reportSaveSuccess();
+          orderSavePending.current = false;
+        }).catch((err) => {
+          reportSaveFailure(err);
+          orderRetryTimer.current = setTimeout(() => retryAllPendingSaves(), nextRetryDelay(1));
+        });
+      }
+    }
+    for (const key in setlistSaveTimers.current) {
+      const entry = setlistSaveTimers.current[key];
+      if (entry && entry.retry && entry.attemptFn) {
+        clearTimeout(entry.retry);
+        entry.retry = null;
+        entry.attemptFn();
       }
     }
     if (defsRetryTimer.current) {
@@ -1204,6 +1322,30 @@ function App() {
       attemptViewsSave();
     }
   }
+  useEffect(() => {
+    function handleBeforeUnload(e) {
+      if (hasPendingWork()) {
+        e.preventDefault();
+        e.returnValue = "";
+      }
+    }
+    function handlePageHide() {
+      for (const id in songSaveTimers.current) {
+        const entry = songSaveTimers.current[id];
+        if (entry && entry.pendingPatch && entry.debounce) {
+          clearTimeout(entry.debounce);
+          entry.debounce = null;
+          attemptSongSaveFor(id);
+        }
+      }
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    window.addEventListener("pagehide", handlePageHide);
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, []);
   useEffect(() => {
     if (!loaded) return;
     function handleVisible() {
@@ -1755,7 +1897,7 @@ function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRe
   const [showMenu, setShowMenu] = useState(false);
   const [showZoomControl, setShowZoomControl] = useState(false);
   useCloseMenuOnOutsideClick(showMenu, () => setShowMenu(false));
-  return /* @__PURE__ */ React.createElement("div", { style: styles.header }, /* @__PURE__ */ React.createElement("div", { style: styles.marqueeWrap }, isBeta ? /* @__PURE__ */ React.createElement("span", { style: styles.betaLogo }, "BETA") : /* @__PURE__ */ React.createElement("img", { src: LOGO_DATA_URI, alt: "Bellafaire Brothers", style: styles.logoImg }), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 1, marginLeft: 6 } }, /* @__PURE__ */ React.createElement(SaveIndicator, { state: saveState, compact: true, lastError: lastSaveError }), /* @__PURE__ */ React.createElement(SyncIndicator, { status: syncStatus, compact: true }))), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement("button", { onClick: onToggleSearch, style: { ...styles.refreshBtn, ...searchOpen ? { borderColor: "var(--gold)" } : {} }, "aria-label": "Search" }, /* @__PURE__ */ React.createElement(Icon, { name: "search", size: 15, color: searchOpen ? "var(--gold)" : "var(--dim)" })), onOpenTodoScreen && /* @__PURE__ */ React.createElement("button", { onClick: onOpenTodoScreen, style: styles.todoHeaderBtn, "aria-label": "To-do list" }, /* @__PURE__ */ React.createElement(Icon, { name: "listCheck", size: 17, color: "var(--dim)" }), openTodoCount > 0 && /* @__PURE__ */ React.createElement("span", { style: styles.todoHeaderBadge }, openTodoCount)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowMenu((v) => !v), style: styles.metaEllipsisBtn, "aria-label": "View and set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), showMenu && /* @__PURE__ */ React.createElement("div", { style: styles.metaMenu }, views && activeViewId && onSelectView && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: styles.metaMenuLabel }, "Viewing as"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: styles.header }, /* @__PURE__ */ React.createElement("div", { style: styles.marqueeWrap }, isBeta ? /* @__PURE__ */ React.createElement("span", { style: styles.betaLogo }, "BETA") : /* @__PURE__ */ React.createElement("img", { src: LOGO_DATA_URI, alt: "Bellafaire Brothers", style: styles.logoImg }), /* @__PURE__ */ React.createElement(StatusDot, { saveState, syncStatus, lastError: lastSaveError })), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement("button", { onClick: onToggleSearch, style: { ...styles.refreshBtn, ...searchOpen ? { borderColor: "var(--gold)" } : {} }, "aria-label": "Search" }, /* @__PURE__ */ React.createElement(Icon, { name: "search", size: 15, color: searchOpen ? "var(--gold)" : "var(--dim)" })), onOpenTodoScreen && /* @__PURE__ */ React.createElement("button", { onClick: onOpenTodoScreen, style: styles.todoHeaderBtn, "aria-label": "To-do list" }, /* @__PURE__ */ React.createElement(Icon, { name: "listCheck", size: 17, color: "var(--dim)" }), openTodoCount > 0 && /* @__PURE__ */ React.createElement("span", { style: styles.todoHeaderBadge }, openTodoCount)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowMenu((v) => !v), style: styles.metaEllipsisBtn, "aria-label": "View and set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), showMenu && /* @__PURE__ */ React.createElement("div", { style: styles.metaMenu }, views && activeViewId && onSelectView && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: styles.metaMenuLabel }, "Viewing as"), /* @__PURE__ */ React.createElement(
     "select",
     {
       value: activeViewId,
@@ -1810,23 +1952,106 @@ function SyncIndicator({ status, compact }) {
     return /* @__PURE__ */ React.createElement("span", { style: { ...base, color: "var(--ready)", display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { name: "refresh", size: compact ? 11 : 13 }), " synced");
   return /* @__PURE__ */ React.createElement("span", { style: { ...base, opacity: 0 } }, "\xB7");
 }
+function StatusDot({ saveState, syncStatus, lastError }) {
+  let color, label, pulse;
+  if (saveState === "offline" || syncStatus === "error") {
+    color = "var(--needs)";
+    label = saveState === "offline" ? "Offline" : "Sync error";
+    pulse = true;
+  } else if (saveState === "error") {
+    color = "var(--needs)";
+    label = "Save failed";
+    pulse = true;
+  } else if (saveState === "saving") {
+    color = "var(--yellow)";
+    label = "Saving\u2026";
+    pulse = true;
+  } else if (syncStatus === "syncing") {
+    color = "var(--yellow)";
+    label = "Syncing\u2026";
+    pulse = false;
+  } else if (saveState === "saved") {
+    color = "var(--ready)";
+    label = "Saved \u2713";
+    pulse = false;
+  } else if (syncStatus === "paused") {
+    color = "var(--yellow)";
+    label = "Paused";
+    pulse = false;
+  } else if (syncStatus === "synced") {
+    color = "var(--ready)";
+    label = "Synced";
+    pulse = false;
+  } else {
+    color = "var(--ready)";
+    label = "Ready";
+    pulse = false;
+  }
+  const showDiag = () => alert(
+    (lastError ? "Last save error:\n" + lastError + "\n\n" : "") + formatDiagLog()
+  );
+  return /* @__PURE__ */ React.createElement(
+    "span",
+    {
+      style: styles.statusDot,
+      onClick: showDiag,
+      title: lastError || "Tap for diagnostics"
+    },
+    /* @__PURE__ */ React.createElement("span", { style: {
+      ...styles.statusDotCircle,
+      background: color,
+      ...pulse ? styles.statusDotPulse : {}
+    } }),
+    /* @__PURE__ */ React.createElement("span", { style: { ...styles.statusDotLabel, color } }, label)
+  );
+}
+function formatDiagLog() {
+  const log = getDiagLog();
+  if (!log.length) return "No recent network calls logged.";
+  return "Recent network calls (newest first):\n\n" + log.slice().reverse().map((e, i) => {
+    const time = e.at ? e.at.replace("T", " ").replace(/\.\d+Z$/, "") : "?";
+    const status = e.ok ? "\u2713 OK" : "\u2717 FAIL";
+    const dur = e.ms != null ? e.ms + "ms" : "?";
+    const err = e.err ? "\n   Error: " + e.err : "";
+    return i + 1 + ". " + time + "  " + e.fn + "  " + status + "  (" + dur + ")" + err;
+  }).join("\n");
+}
 function SaveIndicator({ state, compact, lastError }) {
   const base = compact ? styles.saveTagCompact : styles.saveTag;
+  const showDiag = () => alert(
+    (lastError ? "Last save error:\n" + lastError + "\n\n" : "") + formatDiagLog()
+  );
   if (state === "saving") return /* @__PURE__ */ React.createElement("span", { style: { ...base, color: "var(--yellow)" } }, "saving\u2026");
   if (state === "offline")
     return /* @__PURE__ */ React.createElement(
       "span",
       {
-        style: { ...base, color: "var(--needs)", display: "flex", alignItems: "center", gap: 4, cursor: lastError ? "pointer" : "default" },
-        title: lastError || void 0,
-        onClick: lastError ? () => alert("Last save error:\n\n" + lastError) : void 0
+        style: { ...base, color: "var(--needs)", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" },
+        title: lastError || "Tap for diagnostics",
+        onClick: showDiag
       },
       /* @__PURE__ */ React.createElement(Icon, { name: "wifiOff", size: compact ? 11 : 13 }),
       " Offline"
     );
-  if (state === "error") return /* @__PURE__ */ React.createElement("span", { style: { ...base, color: "var(--needs)" } }, "save failed");
+  if (state === "error")
+    return /* @__PURE__ */ React.createElement(
+      "span",
+      {
+        style: { ...base, color: "var(--needs)", cursor: "pointer" },
+        onClick: showDiag
+      },
+      "save failed"
+    );
   if (state === "saved")
-    return /* @__PURE__ */ React.createElement("span", { style: { ...base, color: "var(--ready)", display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { name: "check", size: compact ? 11 : 13 }), " saved");
+    return /* @__PURE__ */ React.createElement(
+      "span",
+      {
+        style: { ...base, color: "var(--ready)", display: "flex", alignItems: "center", gap: 4, cursor: "pointer" },
+        onClick: showDiag
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "check", size: compact ? 11 : 13 }),
+      " saved"
+    );
   return /* @__PURE__ */ React.createElement("span", { style: { ...base, opacity: 0 } }, "\xB7");
 }
 function SongTitleAndFeatures({ song }) {
@@ -3826,7 +4051,7 @@ function SongDetail({
       },
       onTouchStart: handleSwipeStart
     },
-    /* @__PURE__ */ React.createElement("div", { style: styles.detailTopBar }, /* @__PURE__ */ React.createElement("div", { style: styles.backStack }, /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: styles.backBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "chevronLeft", size: 19, color: "var(--text)" }), /* @__PURE__ */ React.createElement("span", null, "Setlist")), /* @__PURE__ */ React.createElement(SaveIndicator, { state: saveState, compact: true, lastError: lastSaveError }), /* @__PURE__ */ React.createElement(SyncIndicator, { status: syncStatus, compact: true })), /* @__PURE__ */ React.createElement("div", { style: { position: "relative", flexShrink: 0, marginTop: 9 } }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowDotPicker((v) => !v), style: styles.dotBtn, "aria-label": "Change color" }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, width: 13, height: 13, background: getDotColor(song) } })), showDotPicker && /* @__PURE__ */ React.createElement("div", { style: styles.dotPicker }, DOT_COLORS.map((c) => /* @__PURE__ */ React.createElement(
+    /* @__PURE__ */ React.createElement("div", { style: styles.detailTopBar }, /* @__PURE__ */ React.createElement("div", { style: styles.backStack }, /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: styles.backBtn }, /* @__PURE__ */ React.createElement(Icon, { name: "chevronLeft", size: 19, color: "var(--text)" }), /* @__PURE__ */ React.createElement("span", null, "Setlist")), /* @__PURE__ */ React.createElement(StatusDot, { saveState, syncStatus, lastError: lastSaveError })), /* @__PURE__ */ React.createElement("div", { style: { position: "relative", flexShrink: 0, marginTop: 9 } }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowDotPicker((v) => !v), style: styles.dotBtn, "aria-label": "Change color" }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, width: 13, height: 13, background: getDotColor(song) } })), showDotPicker && /* @__PURE__ */ React.createElement("div", { style: styles.dotPicker }, DOT_COLORS.map((c) => /* @__PURE__ */ React.createElement(
       "button",
       {
         key: c.id,
@@ -4070,6 +4295,10 @@ function FontLoad() {
 const spinCss = `
   .spin { animation: spin 0.9s linear infinite; }
   @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  @keyframes statusPulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
   [data-metro-header]:active { background: rgba(255, 255, 255, 0.03); }
 `;
 const vars = {
@@ -4102,6 +4331,10 @@ const rawStyles = {
   logoImg: { height: 34, width: "auto", display: "block" },
   saveTag: { fontFamily: "var(--body)", fontSize: 12, color: "var(--dim)", minWidth: 54, textAlign: "right" },
   saveTagCompact: { fontFamily: "var(--body)", fontSize: 10.5, color: "var(--dim)", textAlign: "left", paddingLeft: 1 },
+  statusDot: { display: "flex", alignItems: "center", gap: 6, marginLeft: 8, cursor: "pointer", WebkitTapHighlightColor: "transparent" },
+  statusDotCircle: { width: 8, height: 8, borderRadius: "50%", flexShrink: 0, transition: "background 0.3s" },
+  statusDotPulse: { animation: "statusPulse 1.2s ease-in-out infinite" },
+  statusDotLabel: { fontFamily: "var(--body)", fontSize: 11, fontWeight: 600, letterSpacing: 0.3, whiteSpace: "nowrap", transition: "color 0.3s" },
   refreshBtn: { background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 8, width: 30, height: 30, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" },
   tabRow: { display: "flex", gap: 6, padding: "0 16px 10px" },
   tab: { flex: 1, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "9px 6px", color: "var(--dim)", fontFamily: "var(--display)", fontWeight: 600, fontSize: 12.5, letterSpacing: "0.03em", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 3 },
