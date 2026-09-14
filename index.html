@@ -132,12 +132,11 @@ function scaleStylesheet(sheet) {
   }
   return scaled;
 }
-const TABS = ["Setlist", "Not In Show", "All Songs"];
+const TABS = ["Setlist", "Not In Show", "Originals", "All Songs"];
 const SONG_HOME_SECTIONS = ["Set 1", "Set 2", "Not In Show"];
 const VIEW_IDS = ["view1", "view2", "view3", "view4", "view5"];
 const DEFAULT_VIEW_NAMES = ["Alex", "Nick", "Caleb", "Dan", "All"];
 const BUILTIN_SECTION_DEFS = [
-  { id: "quickStats", label: "Stats", type: "quickStats" },
   { id: "key", label: "Key (First Chord)", type: "text", mono: true, layout: "inline" },
   { id: "tempoTimeSig", label: "Metronome", type: "metronome" },
   { id: "arrangement", label: "Arrangement", type: "arrangementTable" },
@@ -199,7 +198,8 @@ const BLANK_SONG = {
   alexTodos: [],
   nickTodos: [],
   calebTodos: [],
-  danTodos: []
+  danTodos: [],
+  tags: []
 };
 function Icon({ name, size = 18, color = "currentColor", style, className }) {
   const scaledSize = size * UI_SCALE;
@@ -263,9 +263,6 @@ function getDotColor(song) {
   return song.dotColor || "var(--dim)";
 }
 function sectionHasData(def, song) {
-  if (def.type === "quickStats") {
-    return !!(song.key && String(song.key).trim() || song.tempo && String(song.tempo).trim() || song.timeSig && String(song.timeSig).trim() || song.features && String(song.features).trim());
-  }
   if (def.type === "arrangementTable") {
     return (song.arrangementRows || []).some((r) => r.section && r.section.trim() || r.notes && r.notes.trim());
   }
@@ -302,7 +299,7 @@ function defaultCollapsedState(song, sectionDefsById) {
   const defaults = {};
   Object.keys(sectionDefsById).forEach((id) => {
     const def = sectionDefsById[id];
-    if (!def || def.layout === "inline" || def.type === "quickStats") return;
+    if (!def || def.layout === "inline") return;
     defaults[id] = def.type === "metronome" ? !(song.tempo != null && String(song.tempo).trim() !== "") : !sectionHasData(def, song);
   });
   return defaults;
@@ -524,7 +521,7 @@ function nextRetryDelay(attempt) {
   const base = Math.min(RETRY_DELAY_MS * Math.pow(2, n), RETRY_MAX_DELAY_MS);
   return base + Math.floor(Math.random() * 2e3);
 }
-const APP_VERSION = "2.0.4.2";
+const APP_VERSION = "2.0.5-beta5";
 var _realtimeStatus = "not configured";
 function readRecoverablePatches(raw, now) {
   try {
@@ -742,6 +739,7 @@ async function loadAllDataFromSupabase() {
     songOrder,
     sectionDefs: configMap.sectionDefs || [],
     views: configMap.views || {},
+    tags: configMap.tags || ["Original"],
     version: APP_VERSION,
     dataVersion: null,
     // not used with Supabase — full reads are fast enough
@@ -826,6 +824,14 @@ async function saveViewsToSupabase(views) {
   var client = getSupabaseClient();
   var res = await client.from("config").upsert(
     { key: "views", value: views },
+    { onConflict: "key" }
+  );
+  if (res.error) throw new Error(res.error.message);
+}
+async function saveTagsToSupabase(tags) {
+  var client = getSupabaseClient();
+  var res = await client.from("config").upsert(
+    { key: "tags", value: tags },
     { onConflict: "key" }
   );
   if (res.error) throw new Error(res.error.message);
@@ -1035,6 +1041,7 @@ function App() {
   const [showSetlistEdit, setShowSetlistEdit] = useState(null);
   const [sectionDefs, setSectionDefs] = useState(null);
   const [views, setViews] = useState(null);
+  const [knownTags, setKnownTags] = useState(["Original"]);
   const [activeViewId, setActiveViewId] = useState("view5");
   const [showTodoScreen, setShowTodoScreen] = useState(false);
   const [driveReview, setDriveReview] = useState({ duplicates: [], ambiguous: [], unmatched: [], applied: 0, alreadyLinked: 0 });
@@ -1048,7 +1055,6 @@ function App() {
   const [showViewPicker, setShowViewPicker] = useState(false);
   const [activeTab, setActiveTab] = useState("Setlist");
   const [query, setQuery] = useState("");
-  const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef(null);
   const [openId, setOpenId] = useState(null);
   const [pendingRestore, setPendingRestore] = useState(null);
@@ -1418,6 +1424,7 @@ function App() {
               if (cDefaultId) saveLastSeenDefault(cDefaultId);
               setActiveSetlistId(asid);
               setSectionDefs(cd.sectionDefs);
+              if (cd.tags) setKnownTags(cd.tags);
               setViews(cd.views);
               let avid = prefs.activeViewId;
               const hasStoredView = !!(prefs.activeViewId && cd.views[prefs.activeViewId]);
@@ -1521,6 +1528,7 @@ function App() {
           if (loadedDefaultId) saveLastSeenDefault(loadedDefaultId);
         }
         setSectionDefs(data.sectionDefs);
+        if (data.tags) setKnownTags(data.tags);
         setViews((prev) => usedCache ? data.views && Object.keys(data.views).length ? data.views : prev : data.views);
         if (!usedCache) {
           let avid = prefs.activeViewId;
@@ -1646,6 +1654,7 @@ function App() {
         return nextDefaultId;
       });
       setSectionDefs(data.sectionDefs);
+      if (data.tags) setKnownTags(data.tags);
       setViews((prev) => data.views && Object.keys(data.views).length ? data.views : prev);
       if (data.offline) {
         reportSyncFailure();
@@ -2014,6 +2023,16 @@ function App() {
     const first = slSectionOrder[0];
     persistActiveSetlistSets(setsFromMap({ ...slSongOrder, [first]: [...slSongOrder[first] || [], id] }, slSectionOrder));
   }
+  function moveSongToSet(songId, targetSetName) {
+    const next = {};
+    slSectionOrder.forEach((name) => {
+      next[name] = (slSongOrder[name] || []).filter((x) => x !== songId);
+    });
+    if (targetSetName !== "Not In Show") {
+      next[targetSetName] = [...next[targetSetName] || [], songId];
+    }
+    persistActiveSetlistSets(setsFromMap(next, slSectionOrder));
+  }
   function applySetShape(sets, count, breakMin) {
     const src = Array.isArray(sets) ? sets : [];
     const n = Math.max(1, Math.min(6, Math.round(count || 1)));
@@ -2129,6 +2148,7 @@ function App() {
     if (!songs) return [];
     if (activeTab === "Setlist") return songs.filter((s) => setlistSongIdSet.has(s.id));
     if (activeTab === "Not In Show") return songs.filter((s) => !setlistSongIdSet.has(s.id));
+    if (activeTab === "Originals") return songs.filter((s) => (s.tags || []).includes("Original"));
     return songs;
   }, [songs, activeTab, setlistSongIdSet]);
   const searchResults = useMemo(() => {
@@ -2147,6 +2167,7 @@ function App() {
       return ids;
     }
     if (activeTab === "Not In Show") return notInShowIds;
+    if (activeTab === "Originals") return songs.filter((s) => (s.tags || []).includes("Original")).sort((a, b) => a.title.localeCompare(b.title, void 0, { sensitivity: "base" })).map((s) => s.id);
     return [...songs].sort((a, b) => a.title.localeCompare(b.title, void 0, { sensitivity: "base" })).map((s) => s.id);
   }, [songs, query, searchResults, activeTab, slSectionOrder, slSongOrder, notInShowIds]);
   const sectionDefsById = useMemo(() => sectionDefs ? Object.fromEntries(sectionDefs.map((d) => [d.id, d])) : {}, [sectionDefs]);
@@ -2159,9 +2180,11 @@ function App() {
   if (!songs || !views || !sectionDefs) {
     return /* @__PURE__ */ React.createElement("div", { style: styles.root }, /* @__PURE__ */ React.createElement(FontLoad, null), /* @__PURE__ */ React.createElement("div", { style: styles.loadingWrap }, /* @__PURE__ */ React.createElement(Icon, { name: "loader", className: "spin", size: 28, color: "var(--gold)" }), /* @__PURE__ */ React.createElement("div", { style: { fontFamily: "var(--body)", color: "var(--dim)", marginTop: 12 } }, "Loading setlist\u2026")), /* @__PURE__ */ React.createElement("style", null, spinCss));
   }
+  const originalsCount = songs.filter((s) => (s.tags || []).includes("Original")).length;
   const tabCounts = {
     Setlist: setlistSongIdSet.size,
     "Not In Show": notInShowIds.length,
+    Originals: originalsCount,
     "All Songs": songs.length
   };
   const currentViewName = views[activeViewId] ? views[activeViewId].name : null;
@@ -2184,15 +2207,7 @@ function App() {
       onOpenDriveReview: () => setShowDriveReviewScreen(true),
       views,
       activeViewId,
-      onSelectView: selectView,
-      searchOpen,
-      onToggleSearch: () => {
-        setSearchOpen((v) => {
-          if (!v) setTimeout(() => searchInputRef.current && searchInputRef.current.focus(), 50);
-          else setQuery("");
-          return !v;
-        });
-      }
+      onSelectView: selectView
     }
   ), showDriveReviewScreen && /* @__PURE__ */ React.createElement(
     DriveReviewScreen,
@@ -2302,7 +2317,7 @@ function App() {
   ), /* @__PURE__ */ React.createElement("div", { style: styles.tabRow }, TABS.map((t) => {
     const active = t === activeTab;
     return /* @__PURE__ */ React.createElement("button", { key: t, onClick: () => setActiveTab(t), style: { ...styles.tab, ...active ? styles.tabActive : {} } }, t, /* @__PURE__ */ React.createElement("span", { style: { ...styles.tabCount, ...active ? { color: "var(--bg)" } : {} } }, tabCounts[t]));
-  })), activeTab === "Setlist" && /* @__PURE__ */ React.createElement(
+  })), /* @__PURE__ */ React.createElement("div", { style: styles.searchRow }, /* @__PURE__ */ React.createElement(Icon, { name: "search", size: 17, color: "var(--dim)", style: { flexShrink: 0 } }), /* @__PURE__ */ React.createElement("input", { ref: searchInputRef, value: query, onChange: (e) => setQuery(e.target.value), placeholder: "Search", style: styles.searchInput }), query && /* @__PURE__ */ React.createElement("button", { onClick: () => setQuery(""), style: styles.clearBtn, "aria-label": "Clear search" }, /* @__PURE__ */ React.createElement(Icon, { name: "x", size: 15, color: "var(--dim)" }))), query.trim() ? /* @__PURE__ */ React.createElement(SearchResultsList, { songs: searchResults, onOpen: setOpenId }) : activeTab === "Setlist" ? /* @__PURE__ */ React.createElement("div", { style: styles.list }, /* @__PURE__ */ React.createElement(
     SetlistBar,
     {
       setlist: activeSetlist,
@@ -2314,7 +2329,7 @@ function App() {
       onSwitch: () => setShowSetlistSwitch(true),
       onEdit: () => setShowSetlistEdit("edit")
     }
-  ), searchOpen && /* @__PURE__ */ React.createElement("div", { style: styles.searchRow }, /* @__PURE__ */ React.createElement(Icon, { name: "search", size: 17, color: "var(--dim)", style: { flexShrink: 0 } }), /* @__PURE__ */ React.createElement("input", { ref: searchInputRef, value: query, onChange: (e) => setQuery(e.target.value), placeholder: "Search", style: styles.searchInput }), query && /* @__PURE__ */ React.createElement("button", { onClick: () => setQuery(""), style: styles.clearBtn, "aria-label": "Clear search" }, /* @__PURE__ */ React.createElement(Icon, { name: "x", size: 15, color: "var(--dim)" }))), query.trim() ? /* @__PURE__ */ React.createElement(SearchResultsList, { songs: searchResults, onOpen: setOpenId }) : activeTab === "Setlist" ? /* @__PURE__ */ React.createElement(
+  ), /* @__PURE__ */ React.createElement(
     SetlistView,
     {
       songs,
@@ -2325,9 +2340,10 @@ function App() {
       onSongReorderCommit: commitSetlistSongReorder,
       onHeaderReorderCommit: commitSectionReorder,
       onRemoveFromSetlist: removeSongFromActiveSetlist,
-      hasSetlist: !!activeSetlist
+      hasSetlist: !!activeSetlist,
+      noScrollWrapper: true
     }
-  ) : activeTab === "Not In Show" ? /* @__PURE__ */ React.createElement(NotInShowView, { songs, order: notInShowIds, onOpen: setOpenId, onAdd: addSongToActiveSetlist }) : /* @__PURE__ */ React.createElement(AllSongsView, { songs, onOpen: setOpenId }), /* @__PURE__ */ React.createElement("button", { onClick: addSong, style: styles.fab, "aria-label": "Add song" }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 24, color: "var(--bg)" })), openSong && /* @__PURE__ */ React.createElement(
+  )) : activeTab === "Not In Show" ? /* @__PURE__ */ React.createElement(NotInShowView, { songs, order: notInShowIds, onOpen: setOpenId, onAdd: addSongToActiveSetlist }) : activeTab === "Originals" ? /* @__PURE__ */ React.createElement(OriginalsView, { songs, onOpen: setOpenId }) : /* @__PURE__ */ React.createElement(AllSongsView, { songs, onOpen: setOpenId }), /* @__PURE__ */ React.createElement("button", { onClick: addSong, style: styles.fab, "aria-label": "Add song" }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 24, color: "var(--bg)" })), openSong && /* @__PURE__ */ React.createElement(
     SongDetail,
     {
       song: openSong,
@@ -2364,7 +2380,23 @@ function App() {
       onRefresh: handleManualRefresh,
       refreshing,
       manualRefreshing,
-      onBeforeReload: saveReloadSnapshot
+      onBeforeReload: saveReloadSnapshot,
+      setNames: slSectionOrder,
+      songSetName: (() => {
+        for (const name of slSectionOrder) {
+          if ((slSongOrder[name] || []).includes(openSong.id)) return name;
+        }
+        return null;
+      })(),
+      onSetAssignment: (targetSetName) => moveSongToSet(openSong.id, targetSetName),
+      knownTags,
+      onTagsChange: (newTag) => {
+        setKnownTags((prev) => {
+          const next = prev.includes(newTag) ? prev : [...prev, newTag];
+          supabaseCall("saveTags", () => saveTagsToSupabase(next));
+          return next;
+        });
+      }
     }
   ), showSetlistSwitch && /* @__PURE__ */ React.createElement(
     SetlistSwitchSheet,
@@ -2448,11 +2480,11 @@ function ViewPickerModal({ views, currentViewId, onPick }) {
     );
   }))));
 }
-function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRefreshing, onBeforeReload, openTodoCount, onOpenTodoScreen, lastSaveError, driveNeedsAttentionCount, onOpenDriveReview, views, activeViewId, onSelectView, searchOpen, onToggleSearch }) {
+function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRefreshing, onBeforeReload, openTodoCount, onOpenTodoScreen, lastSaveError, driveNeedsAttentionCount, onOpenDriveReview, views, activeViewId, onSelectView }) {
   const [showMenu, setShowMenu] = useState(false);
   const [showZoomControl, setShowZoomControl] = useState(false);
   useCloseMenuOnOutsideClick(showMenu, () => setShowMenu(false));
-  return /* @__PURE__ */ React.createElement("div", { style: styles.header }, /* @__PURE__ */ React.createElement("div", { style: styles.marqueeWrap }, isBeta ? /* @__PURE__ */ React.createElement("span", { style: styles.betaLogo }, "BETA") : /* @__PURE__ */ React.createElement("img", { src: LOGO_DATA_URI, alt: "Bellafaire Brothers", style: styles.logoImg }), /* @__PURE__ */ React.createElement(StatusDot, { saveState, syncStatus, lastError: lastSaveError })), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, /* @__PURE__ */ React.createElement("button", { onClick: onToggleSearch, style: { ...styles.refreshBtn, ...searchOpen ? { borderColor: "var(--gold)" } : {} }, "aria-label": "Search" }, /* @__PURE__ */ React.createElement(Icon, { name: "search", size: 15, color: searchOpen ? "var(--gold)" : "var(--dim)" })), onOpenTodoScreen && /* @__PURE__ */ React.createElement("button", { onClick: onOpenTodoScreen, style: styles.todoHeaderBtn, "aria-label": "To-do list" }, /* @__PURE__ */ React.createElement(Icon, { name: "listCheck", size: 17, color: "var(--dim)" }), openTodoCount > 0 && /* @__PURE__ */ React.createElement("span", { style: styles.todoHeaderBadge }, openTodoCount)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowMenu((v) => !v), style: styles.metaEllipsisBtn, "aria-label": "View and set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), showMenu && /* @__PURE__ */ React.createElement("div", { style: styles.metaMenu }, views && activeViewId && onSelectView && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: styles.metaMenuLabel }, "Viewing as"), /* @__PURE__ */ React.createElement(
+  return /* @__PURE__ */ React.createElement("div", { style: styles.header }, /* @__PURE__ */ React.createElement("div", { style: styles.marqueeWrap }, isBeta ? /* @__PURE__ */ React.createElement("span", { style: styles.betaLogo }, "BETA") : /* @__PURE__ */ React.createElement("img", { src: LOGO_DATA_URI, alt: "Bellafaire Brothers", style: styles.logoImg }), /* @__PURE__ */ React.createElement(StatusDot, { saveState, syncStatus, lastError: lastSaveError })), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } }, onOpenTodoScreen && /* @__PURE__ */ React.createElement("button", { onClick: onOpenTodoScreen, style: styles.todoHeaderBtn, "aria-label": "To-do list" }, /* @__PURE__ */ React.createElement(Icon, { name: "listCheck", size: 17, color: "var(--dim)" }), openTodoCount > 0 && /* @__PURE__ */ React.createElement("span", { style: styles.todoHeaderBadge }, openTodoCount)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowMenu((v) => !v), style: styles.metaEllipsisBtn, "aria-label": "View and set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), showMenu && /* @__PURE__ */ React.createElement("div", { style: styles.metaMenu }, views && activeViewId && onSelectView && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: styles.metaMenuLabel }, "Viewing as"), /* @__PURE__ */ React.createElement(
     "select",
     {
       value: activeViewId,
@@ -2709,7 +2741,7 @@ function SetlistEditForm({ mode, setlist, canDelete, hasCurrent, defaultSetlistI
     "Delete"
   )), /* @__PURE__ */ React.createElement("button", { style: { ...styles.modalCancel, marginTop: 8, width: "100%" }, onClick: onClose }, "Cancel")));
 }
-function SetlistView({ songs, sectionOrder, songOrder, setBreaks, onOpen, onSongReorderCommit, onHeaderReorderCommit, onRemoveFromSetlist, hasSetlist }) {
+function SetlistView({ songs, sectionOrder, songOrder, setBreaks, onOpen, onSongReorderCommit, onHeaderReorderCommit, onRemoveFromSetlist, hasSetlist, noScrollWrapper }) {
   const songsById = useMemo(() => Object.fromEntries(songs.map((s) => [s.id, s])), [songs]);
   const [localSectionOrder, setLocalSectionOrder] = useState(sectionOrder);
   const [localSongOrder, setLocalSongOrder] = useState(songOrder);
@@ -2809,7 +2841,8 @@ function SetlistView({ songs, sectionOrder, songOrder, setBreaks, onOpen, onSong
   }
   const isEmpty = localSectionOrder.every((sec) => (localSongOrder[sec] || []).length === 0);
   const brk = (i) => setBreaks && setBreaks[i] || 0;
-  return /* @__PURE__ */ React.createElement("div", { style: styles.list }, localSectionOrder.map((sec, secIndex) => /* @__PURE__ */ React.createElement(React.Fragment, { key: sec }, /* @__PURE__ */ React.createElement("div", { ref: setRowRef("header:" + sec), style: { ...styles.sectionDivider, ...activeDragId === "header:" + sec ? styles.dragging : {} } }, /* @__PURE__ */ React.createElement("span", { style: styles.sectionDividerLabel }, sec), /* @__PURE__ */ React.createElement("span", { style: styles.sectionDividerCount }, (localSongOrder[sec] || []).length), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setOpenHeaderMenuFor((cur) => cur === sec ? null : sec), style: styles.atomicMenuBtn, "aria-label": "Set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), openHeaderMenuFor === sec && /* @__PURE__ */ React.createElement("div", { style: styles.sectionMenu }, /* @__PURE__ */ React.createElement(
+  const Wrap = noScrollWrapper ? React.Fragment : (p) => /* @__PURE__ */ React.createElement("div", { style: styles.list }, p.children);
+  return /* @__PURE__ */ React.createElement(Wrap, null, localSectionOrder.map((sec, secIndex) => /* @__PURE__ */ React.createElement(React.Fragment, { key: sec }, /* @__PURE__ */ React.createElement("div", { ref: setRowRef("header:" + sec), style: { ...styles.sectionDivider, ...activeDragId === "header:" + sec ? styles.dragging : {} } }, /* @__PURE__ */ React.createElement("span", { style: styles.sectionDividerLabel }, sec), /* @__PURE__ */ React.createElement("span", { style: styles.sectionDividerCount }, (localSongOrder[sec] || []).length), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setOpenHeaderMenuFor((cur) => cur === sec ? null : sec), style: styles.atomicMenuBtn, "aria-label": "Set options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 16, color: "var(--dim)" })), openHeaderMenuFor === sec && /* @__PURE__ */ React.createElement("div", { style: styles.sectionMenu }, /* @__PURE__ */ React.createElement(
     "button",
     {
       onClick: () => {
@@ -2845,6 +2878,13 @@ function NotInShowView({ songs, order, onOpen, onAdd }) {
 function AllSongsView({ songs, onOpen }) {
   const sorted = useMemo(() => [...songs].sort((a, b) => a.title.localeCompare(b.title, void 0, { sensitivity: "base" })), [songs]);
   return /* @__PURE__ */ React.createElement("div", { style: styles.list }, sorted.map((s) => /* @__PURE__ */ React.createElement("button", { key: s.id, onClick: () => onOpen(s.id), style: styles.row }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, background: getDotColor(s) } }), /* @__PURE__ */ React.createElement(SongTitleAndFeatures, { song: s }))), sorted.length === 0 && /* @__PURE__ */ React.createElement("div", { style: styles.emptyState }, /* @__PURE__ */ React.createElement(Icon, { name: "music", size: 26, color: "var(--line)" }), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, "No songs yet.")));
+}
+function OriginalsView({ songs, onOpen }) {
+  const sorted = useMemo(
+    () => songs.filter((s) => (s.tags || []).includes("Original")).sort((a, b) => a.title.localeCompare(b.title, void 0, { sensitivity: "base" })),
+    [songs]
+  );
+  return /* @__PURE__ */ React.createElement("div", { style: styles.list }, sorted.map((s) => /* @__PURE__ */ React.createElement("button", { key: s.id, onClick: () => onOpen(s.id), style: styles.row }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, background: getDotColor(s) } }), /* @__PURE__ */ React.createElement(SongTitleAndFeatures, { song: s }))), sorted.length === 0 && /* @__PURE__ */ React.createElement("div", { style: styles.emptyState }, /* @__PURE__ */ React.createElement(Icon, { name: "music", size: 26, color: "var(--line)" }), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, "No songs tagged as originals yet.")));
 }
 function SearchResultsList({ songs, onOpen }) {
   return /* @__PURE__ */ React.createElement("div", { style: styles.list }, songs.map((s) => /* @__PURE__ */ React.createElement("button", { key: s.id, onClick: () => onOpen(s.id), style: styles.row }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, background: getDotColor(s) } }), /* @__PURE__ */ React.createElement(SongTitleAndFeatures, { song: s }))), songs.length === 0 && /* @__PURE__ */ React.createElement("div", { style: styles.emptyState }, /* @__PURE__ */ React.createElement(Icon, { name: "music", size: 26, color: "var(--line)" }), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 10 } }, "No songs match your search.")));
@@ -3915,6 +3955,80 @@ function ZoomControl({ onBeforeReload, onClose }) {
     }
   ), /* @__PURE__ */ React.createElement("div", { style: styles.zoomPctLabel }, draftPct, "%")), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 14 } }, /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: styles.modalCancel }, "Cancel"), hasOverride && /* @__PURE__ */ React.createElement("button", { onClick: resetToDefault, style: styles.modalCancel }, "Reset to default"), /* @__PURE__ */ React.createElement("button", { onClick: apply, style: styles.modalConfirm }, "Apply"))));
 }
+function TagPickerSheet({ songTags, knownTags, onToggle, onCreateTag, onClose }) {
+  const [newTag, setNewTag] = useState("");
+  const allTags = useMemo(() => {
+    const set = /* @__PURE__ */ new Set([...knownTags, ...songTags]);
+    return [...set].sort((a, b) => a.localeCompare(b, void 0, { sensitivity: "base" }));
+  }, [knownTags, songTags]);
+  function handleCreate() {
+    const trimmed = newTag.trim();
+    if (!trimmed) return;
+    if (!allTags.some((t) => t.toLowerCase() === trimmed.toLowerCase())) {
+      onCreateTag(trimmed);
+    }
+    if (!songTags.includes(trimmed)) {
+      onToggle(trimmed);
+    }
+    setNewTag("");
+  }
+  return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop, onClick: onClose }, /* @__PURE__ */ React.createElement("div", { style: { ...styles.modalCard, maxWidth: 340 }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, "Tags"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 2, marginTop: 8 } }, allTags.map((tag) => {
+    const active = songTags.includes(tag);
+    return /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: tag,
+        onClick: () => onToggle(tag),
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          background: "none",
+          border: "none",
+          color: "var(--text)",
+          padding: "10px 4px",
+          cursor: "pointer",
+          textAlign: "left",
+          borderBottom: "1px solid var(--line)",
+          fontFamily: "var(--body)",
+          fontSize: 15
+        }
+      },
+      /* @__PURE__ */ React.createElement("span", { style: {
+        width: 22,
+        height: 22,
+        borderRadius: 6,
+        border: active ? "2px solid var(--gold)" : "2px solid var(--line)",
+        background: active ? "rgba(227,168,59,0.15)" : "transparent",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        flexShrink: 0,
+        fontSize: 13,
+        color: "var(--gold)"
+      } }, active ? "\u2713" : ""),
+      tag
+    );
+  })), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 14 } }, /* @__PURE__ */ React.createElement(
+    "input",
+    {
+      value: newTag,
+      onChange: (e) => setNewTag(e.target.value),
+      placeholder: "New tag\u2026",
+      style: { ...styles.modalInput, flex: 1, marginBottom: 0 },
+      onKeyDown: (e) => {
+        if (e.key === "Enter") handleCreate();
+      }
+    }
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: handleCreate,
+      style: { ...styles.modalConfirm, ...newTag.trim() ? {} : { opacity: 0.4, pointerEvents: "none" }, padding: "8px 14px", whiteSpace: "nowrap" }
+    },
+    "Add"
+  )), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { ...styles.modalCancel, marginTop: 12, width: "100%" } }, "Done")));
+}
 function AddSectionModal({ onClose, onAdd }) {
   const [kind, setKind] = useState(null);
   const [name, setName] = useState("");
@@ -4383,10 +4497,16 @@ function SongDetail({
   onRefresh,
   refreshing,
   manualRefreshing,
-  onBeforeReload
+  onBeforeReload,
+  setNames,
+  songSetName,
+  onSetAssignment,
+  knownTags,
+  onTagsChange
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showZoomControl, setShowZoomControl] = useState(false);
+  const [showTagPicker, setShowTagPicker] = useState(false);
   const [linksEditModeFor, setLinksEditModeFor] = useState(null);
   const [showAddAudio, setShowAddAudio] = useState(false);
   const [showRecord, setShowRecord] = useState(false);
@@ -4440,15 +4560,11 @@ function SongDetail({
     }
   }, [song.id]);
   const visibleIds = useMemo(() => {
-    let ids = [...activeView.visibleSections];
-    if (!ids.includes("quickStats")) {
+    let ids = [...activeView.visibleSections].filter((id) => id !== "quickStats");
+    if (!ids.includes("key")) ids.unshift("key");
+    if (!ids.includes("features")) {
       const keyIdx = ids.indexOf("key");
-      if (keyIdx !== -1) {
-        ids[keyIdx] = "quickStats";
-      } else {
-        ids.unshift("quickStats");
-      }
-      ids = ids.filter((id) => id !== "features");
+      ids.splice(keyIdx + 1, 0, "features");
     }
     return ids;
   }, [activeView.visibleSections]);
@@ -4461,7 +4577,7 @@ function SongDetail({
     const set = /* @__PURE__ */ new Set();
     localOrder.forEach((id) => {
       const def = sectionDefsById[id];
-      if (def && def.type !== "quickStats" && !sectionHasData(def, song)) set.add(id);
+      if (def && !sectionHasData(def, song)) set.add(id);
     });
     return set;
   }, [localOrder, sectionDefsById, song]);
@@ -4671,28 +4787,6 @@ function SongDetail({
       const isLinksList = def.type === "linksList";
       const isTodoList = def.type === "todoList";
       const todoArrForInline = isTodoList ? song[def.id] || [] : null;
-      if (def.type === "quickStats") {
-        const keyVal = song.key || "";
-        const bpmVal = song.tempo == null ? "" : String(song.tempo);
-        const sigVal = song.timeSig == null ? "" : String(song.timeSig);
-        const featVal = song.features || "";
-        return /* @__PURE__ */ React.createElement("div", { key: id, ref: setRowRef(id), style: { ...styles.quickStatsRow, ...openMenuFor === id ? { position: "relative", zIndex: 25 } : {}, ...activeDragId === id ? styles.dragging : {} } }, sectionEditMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startDrag(id), style: styles.atomicDragHandle, "data-swipe-ignore": "true" }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 15, color: "var(--dim)" })), /* @__PURE__ */ React.createElement("div", { style: styles.quickStatsGrid }, /* @__PURE__ */ React.createElement("div", { style: styles.quickStatCell }, /* @__PURE__ */ React.createElement("input", { value: keyVal, onChange: (e) => onChange({ key: e.target.value }), onBlur: onFieldBlur, spellCheck: false, autoCorrect: "off", autoCapitalize: "off", style: { ...styles.quickStatInput, color: "var(--gold)" } }), /* @__PURE__ */ React.createElement("span", { style: styles.quickStatLabel }, "KEY")), /* @__PURE__ */ React.createElement("div", { style: styles.quickStatDivider }), /* @__PURE__ */ React.createElement("div", { style: styles.quickStatCell }, /* @__PURE__ */ React.createElement(
-          "input",
-          {
-            value: bpmVal,
-            type: "text",
-            inputMode: "numeric",
-            pattern: "[0-9]*",
-            onChange: (e) => onChange({ tempo: e.target.value.replace(/[^\d]/g, "").slice(0, 3) }),
-            onBlur: (e) => {
-              const n = parseInt(e.target.value, 10);
-              if (!isNaN(n)) onChange({ tempo: String(Math.max(20, Math.min(300, n))) });
-              onFieldBlur();
-            },
-            style: styles.quickStatInput
-          }
-        ), /* @__PURE__ */ React.createElement("span", { style: styles.quickStatLabel }, "BPM")), /* @__PURE__ */ React.createElement("div", { style: styles.quickStatDivider }), /* @__PURE__ */ React.createElement("div", { style: styles.quickStatCell }, /* @__PURE__ */ React.createElement("input", { value: sigVal, type: "text", onChange: (e) => onChange({ timeSig: e.target.value }), onBlur: onFieldBlur, spellCheck: false, autoCorrect: "off", style: styles.quickStatInput }), /* @__PURE__ */ React.createElement("span", { style: styles.quickStatLabel }, "TIME")), featVal ? /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("div", { style: styles.quickStatDivider }), /* @__PURE__ */ React.createElement("div", { style: { ...styles.quickStatCell, flex: 1.3 } }, /* @__PURE__ */ React.createElement("input", { value: featVal, onChange: (e) => onChange({ features: e.target.value }), onBlur: onFieldBlur, spellCheck: false, autoCorrect: "off", style: { ...styles.quickStatInput, fontFamily: "var(--display)", fontSize: 14, fontWeight: 600 } }), /* @__PURE__ */ React.createElement("span", { style: styles.quickStatLabel }, "FEAT."))) : null));
-      }
       const emptyDividerEl = showEmptyDivider ? /* @__PURE__ */ React.createElement("div", { key: "__empty_divider", style: styles.emptyDivider }, /* @__PURE__ */ React.createElement("span", { style: styles.emptyDividerText }, "Empty")) : null;
       if (isTodoList && todoArrForInline.length === 0) {
         return /* @__PURE__ */ React.createElement(React.Fragment, { key: id }, emptyDividerEl, /* @__PURE__ */ React.createElement("div", { ref: setRowRef(id), style: { ...styles.atomicInlineRow, ...openMenuFor === id ? { position: "relative", zIndex: 25 } : {}, ...activeDragId === id ? styles.dragging : {} } }, sectionEditMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startDrag(id), style: styles.atomicDragHandle, "data-swipe-ignore": "true" }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 15, color: "var(--dim)" })), renamingSectionId === id ? /* @__PURE__ */ React.createElement(
@@ -4806,7 +4900,7 @@ function SongDetail({
             },
             style: styles.metroInput
           }
-        ), /* @__PURE__ */ React.createElement("span", { style: styles.metroUnit }, "BPM")), /* @__PURE__ */ React.createElement("span", { style: styles.metroField }, /* @__PURE__ */ React.createElement("span", { style: styles.metroFieldLabel }, "Time Sig"), /* @__PURE__ */ React.createElement(
+        ), /* @__PURE__ */ React.createElement("span", { style: styles.metroUnit }, "BPM")), /* @__PURE__ */ React.createElement("span", { style: styles.metroField }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.metroFieldLabel, ...!timeSigVal ? styles.metroFieldLabelEmpty : {} } }, "Time Sig"), /* @__PURE__ */ React.createElement(
           "input",
           {
             value: timeSigVal,
@@ -4859,7 +4953,22 @@ function SongDetail({
           style: styles.sectionRenameInput
         }
       )) : /* @__PURE__ */ React.createElement("button", { onClick: () => setCollapsed((p) => ({ ...p, [id]: !p[id] })), style: styles.atomicToggle }, isCollapsed ? /* @__PURE__ */ React.createElement(Icon, { name: "chevronRight", size: 16, color: "var(--dim)" }) : /* @__PURE__ */ React.createElement(Icon, { name: "chevronDown", size: 16, color: "var(--dim)" }), /* @__PURE__ */ React.createElement("span", { style: { ...styles.atomicLabel, ...!hasData ? styles.atomicLabelEmpty : {} } }, def.label), previewText && /* @__PURE__ */ React.createElement("span", { style: styles.sectionPreview }, previewText)), /* @__PURE__ */ React.createElement("div", { style: { position: "relative" }, "data-menu-root": true }, /* @__PURE__ */ React.createElement("button", { onClick: () => setOpenMenuFor((cur) => cur === id ? null : id), style: styles.atomicMenuBtn, "aria-label": "Section options" }, /* @__PURE__ */ React.createElement(Icon, { name: "moreHorizontal", size: 15, color: "var(--dim)" })), renderMenu(id, def))), !isCollapsed && /* @__PURE__ */ React.createElement("div", { style: { ...styles.atomicContent, paddingLeft: sectionEditMode ? 25 : 4 } }, renderSectionContent(def, song, onChange, arrColPct, onArrColPctChange, arrEditMode, onFieldBlur))));
-    })), hiddenSections.length > 0 && activeTab === "overview" && /* @__PURE__ */ React.createElement("div", { style: styles.addSectionWrap }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowHidden((v) => !v), style: styles.addSectionBtn }, showHidden ? "Hide list" : `Show hidden sections (${hiddenSections.length})`), showHidden && /* @__PURE__ */ React.createElement("div", { style: styles.hiddenChipRow }, hiddenSections.map((id) => /* @__PURE__ */ React.createElement("button", { key: id, onClick: () => onShowSection(id), style: styles.hiddenChip }, "+ ", sectionDefsById[id]?.label))))),
+    })), activeTab === "overview" && setNames && setNames.length > 0 && /* @__PURE__ */ React.createElement("div", { style: styles.setAssignWrap }, setNames.map((name) => /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        key: name,
+        onClick: () => onSetAssignment(name),
+        style: { ...styles.setAssignChip, ...songSetName === name ? styles.setAssignChipActive : {} }
+      },
+      name
+    )), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => onSetAssignment("Not In Show"),
+        style: { ...styles.setAssignChip, ...songSetName === null ? styles.setAssignChipActive : {} }
+      },
+      "Not In Show"
+    )), activeTab === "overview" && /* @__PURE__ */ React.createElement("div", { style: styles.tagsSection }, /* @__PURE__ */ React.createElement("div", { style: styles.tagsLabel }, "Tags"), /* @__PURE__ */ React.createElement("div", { style: styles.tagsRow }, (song.tags || []).map((tag) => /* @__PURE__ */ React.createElement("span", { key: tag, style: styles.tagChip }, tag)), /* @__PURE__ */ React.createElement("button", { onClick: () => setShowTagPicker(true), style: styles.tagAddBtn, "aria-label": "Add tag" }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", size: 14, color: "var(--dim)" })))), hiddenSections.length > 0 && activeTab === "overview" && /* @__PURE__ */ React.createElement("div", { style: styles.addSectionWrap }, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowHidden((v) => !v), style: styles.addSectionBtn }, showHidden ? "Hide list" : `Show hidden sections (${hiddenSections.length})`), showHidden && /* @__PURE__ */ React.createElement("div", { style: styles.hiddenChipRow }, hiddenSections.map((id) => /* @__PURE__ */ React.createElement("button", { key: id, onClick: () => onShowSection(id), style: styles.hiddenChip }, "+ ", sectionDefsById[id]?.label))))),
     showAddSection && /* @__PURE__ */ React.createElement(
       AddSectionModal,
       {
@@ -4871,6 +4980,23 @@ function SongDetail({
       }
     ),
     showZoomControl && /* @__PURE__ */ React.createElement(ZoomControl, { onBeforeReload, onClose: () => setShowZoomControl(false) }),
+    showTagPicker && /* @__PURE__ */ React.createElement(
+      TagPickerSheet,
+      {
+        songTags: song.tags || [],
+        knownTags: knownTags || [],
+        onToggle: (tag) => {
+          const current = song.tags || [];
+          const next = current.includes(tag) ? current.filter((t) => t !== tag) : [...current, tag];
+          onChange({ tags: next });
+        },
+        onCreateTag: (tag) => onTagsChange(tag),
+        onClose: () => {
+          setShowTagPicker(false);
+          onFieldBlur();
+        }
+      }
+    ),
     showAddAudio && /* @__PURE__ */ React.createElement(
       AddRecordingSheet,
       {
@@ -4968,7 +5094,7 @@ const rawStyles = {
   // ---- 1.7.2-beta2 setlist bar + sheets ----
   nisAddBtn: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 10.5, letterSpacing: "0.05em", textTransform: "uppercase", color: "var(--gold)", background: "none", border: "1px solid rgba(227,168,59,0.45)", borderRadius: 7, padding: "6px 12px", cursor: "pointer", flexShrink: 0, marginRight: 6 },
   slRemoveBtn: { background: "none", border: "none", cursor: "pointer", padding: "4px 8px", display: "flex", alignItems: "center", flexShrink: 0 },
-  slBar: { margin: "0 16px 10px", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 11, overflow: "hidden" },
+  slBar: { margin: "0 0 10px", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 11, overflow: "hidden", flexShrink: 0 },
   slBarRow: { display: "flex", alignItems: "flex-start", gap: 9, width: "100%", background: "none", border: "none", cursor: "pointer", padding: "11px 12px", textAlign: "left" },
   slBarCaretWrap: { flexShrink: 0, display: "flex", marginTop: 3 },
   slBarName: { flex: 1, minWidth: 0, fontFamily: "var(--display)", fontWeight: 600, fontSize: 16.5, color: "var(--text)", letterSpacing: "0.01em", lineHeight: 1.24, whiteSpace: "normal", overflowWrap: "break-word", paddingTop: 2 },
@@ -5042,19 +5168,22 @@ const rawStyles = {
   atomicMenuBtn: { background: "none", border: "none", cursor: "pointer", padding: 10, margin: -6, flexShrink: 0, opacity: 0.65 },
   atomicContent: { padding: "0 2px 8px 4px" },
   atomicInlineRow: { display: "flex", alignItems: "center", gap: 3, padding: "7px 0", borderBottom: "1px solid var(--line)" },
-  // Quick Stats bar — Key | BPM | Time Sig | Featured Artist
-  quickStatsRow: { display: "flex", alignItems: "center", gap: 3, background: "var(--surface)", borderBottom: "1px solid var(--line)" },
-  quickStatsGrid: { flex: 1, display: "flex", gap: 0, minWidth: 0 },
-  quickStatDivider: { width: 1, alignSelf: "stretch", background: "var(--line)" },
-  quickStatCell: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 0, minWidth: 0, padding: "7px 4px 5px" },
-  quickStatLabel: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 7.5, textTransform: "uppercase", letterSpacing: "0.08em", color: "var(--dim)", marginTop: 2 },
-  quickStatInput: { background: "transparent", border: "none", borderBottom: "2px solid transparent", color: "var(--text)", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, fontSize: 17, padding: "0 0 2px", width: "auto", minWidth: 24, textAlign: "center", maxWidth: "100%" },
+  // Set assignment control
+  setAssignWrap: { padding: "12px 4px 8px", display: "flex", gap: 6, flexWrap: "wrap" },
+  setAssignChip: { flex: 1, minWidth: 0, padding: "8px 4px", borderRadius: 8, border: "1.5px solid var(--line)", background: "transparent", color: "var(--dim)", fontFamily: "var(--display)", fontWeight: 600, fontSize: 13, textAlign: "center", cursor: "pointer", transition: "all 0.15s", WebkitTapHighlightColor: "transparent" },
+  setAssignChipActive: { border: "1.5px solid var(--gold)", background: "rgba(227,168,59,0.12)", color: "var(--gold)" },
+  // Tags section
+  tagsSection: { padding: "8px 4px 4px" },
+  tagsLabel: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--dim)", marginBottom: 6 },
+  tagsRow: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" },
+  tagChip: { display: "inline-flex", alignItems: "center", padding: "5px 12px", borderRadius: 20, border: "1.5px solid var(--gold)", background: "rgba(227,168,59,0.10)", color: "var(--gold)", fontFamily: "var(--display)", fontWeight: 600, fontSize: 12.5 },
+  tagAddBtn: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 28, height: 28, borderRadius: 14, border: "1.5px dashed var(--line)", background: "none", cursor: "pointer", WebkitTapHighlightColor: "transparent" },
   // Section content preview (collapsed)
   sectionPreview: { fontFamily: "var(--body)", fontWeight: 400, fontSize: 13, color: "var(--dim)", opacity: 0.55, marginLeft: 8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 },
   // Empty section auto-sort
   emptyDivider: { padding: "10px 0 4px", display: "flex", alignItems: "center", gap: 8 },
   emptyDividerText: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: "var(--dim)", opacity: 0.5 },
-  atomicLabelInline: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 16.5, color: "var(--text)", whiteSpace: "nowrap", flexShrink: 0 },
+  atomicLabelInline: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 16.5, color: "var(--text)", whiteSpace: "nowrap", flexShrink: 0, minWidth: 160 },
   inlineInput: { flex: 1, minWidth: 0, background: "transparent", border: "none", color: "var(--text)", fontSize: 16.5, padding: "4px 2px" },
   // Metronome section — header row (chevron + Tempo/Time Sig values, always editable)
   // The whole row is the collapse toggle; this just adds the affordance.
