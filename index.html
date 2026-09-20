@@ -255,6 +255,14 @@ function Icon({ name, size = 18, color = "currentColor", style, className }) {
       return /* @__PURE__ */ React.createElement("svg", { ...common }, /* @__PURE__ */ React.createElement("polygon", { points: "12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" }));
     case "starFilled":
       return /* @__PURE__ */ React.createElement("svg", { ...common, fill: color }, /* @__PURE__ */ React.createElement("polygon", { points: "12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" }));
+    case "undo":
+      return /* @__PURE__ */ React.createElement("svg", { ...common }, /* @__PURE__ */ React.createElement("polyline", { points: "1 4 1 10 7 10" }), /* @__PURE__ */ React.createElement("path", { d: "M3.51 15a9 9 0 1 0 2.13-9.36L1 10" }));
+    case "redo":
+      return /* @__PURE__ */ React.createElement("svg", { ...common }, /* @__PURE__ */ React.createElement("polyline", { points: "23 4 23 10 17 10" }), /* @__PURE__ */ React.createElement("path", { d: "M20.49 15a9 9 0 1 1-2.13-9.36L23 10" }));
+    case "clipboard":
+      return /* @__PURE__ */ React.createElement("svg", { ...common }, /* @__PURE__ */ React.createElement("path", { d: "M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" }), /* @__PURE__ */ React.createElement("rect", { x: "8", y: "2", width: "8", height: "4", rx: "1", ry: "1" }));
+    case "clock":
+      return /* @__PURE__ */ React.createElement("svg", { ...common }, /* @__PURE__ */ React.createElement("circle", { cx: "12", cy: "12", r: "10" }), /* @__PURE__ */ React.createElement("polyline", { points: "12 6 12 12 16 14" }));
     default:
       return null;
   }
@@ -521,7 +529,7 @@ function nextRetryDelay(attempt) {
   const base = Math.min(RETRY_DELAY_MS * Math.pow(2, n), RETRY_MAX_DELAY_MS);
   return base + Math.floor(Math.random() * 2e3);
 }
-const APP_VERSION = "2.0.5";
+const APP_VERSION = "2.0.6-beta4";
 var _realtimeStatus = "not configured";
 function readRecoverablePatches(raw, now) {
   try {
@@ -747,7 +755,7 @@ async function loadAllDataFromSupabase() {
     isBeta: channelName.indexOf("beta") !== -1
   };
 }
-async function saveSongPatchToSupabase(patch) {
+async function saveSongPatchToSupabase(patch, viewerName) {
   var client = getSupabaseClient();
   var id = patch.id;
   var dbUpdate = {};
@@ -760,9 +768,33 @@ async function saveSongPatchToSupabase(patch) {
       customUpdate[k] = patch[k];
     }
   }
+  var changedFields = Object.keys(patch).filter(function(k2) {
+    return k2 !== "id";
+  });
+  var oldValues = {};
+  var songTitle = null;
+  var oldRow = null;
+  if (changedFields.length > 0) {
+    var selectCols = ["title", "customFields"];
+    changedFields.forEach(function(k2) {
+      if (SUPABASE_SONG_COLUMNS.has(k2) && selectCols.indexOf(k2) === -1) selectCols.push(k2);
+    });
+    var oldRes = await client.from("songs").select(selectCols.join(",")).eq("id", id).single();
+    oldRow = oldRes.data || null;
+    if (oldRow) {
+      songTitle = oldRow.title || null;
+      changedFields.forEach(function(k2) {
+        if (SUPABASE_SONG_COLUMNS.has(k2)) {
+          oldValues[k2] = oldRow[k2];
+        } else if (oldRow.customFields) {
+          oldValues[k2] = oldRow.customFields[k2];
+        }
+      });
+    }
+  }
   if (Object.keys(customUpdate).length > 0) {
-    var cur = await client.from("songs").select("customFields").eq("id", id).single();
-    dbUpdate.customFields = Object.assign({}, cur.data && cur.data.customFields || {}, customUpdate);
+    var existingCustom = oldRow && oldRow.customFields || {};
+    dbUpdate.customFields = Object.assign({}, existingCustom, customUpdate);
   }
   dbUpdate.updated_at = (/* @__PURE__ */ new Date()).toISOString();
   var res = await client.from("songs").upsert(
@@ -770,6 +802,16 @@ async function saveSongPatchToSupabase(patch) {
     { onConflict: "id" }
   );
   if (res.error) throw new Error(res.error.message);
+  var changes = [];
+  changedFields.forEach(function(k2) {
+    var oldVal = oldValues[k2];
+    var newVal = patch[k2];
+    if (JSON.stringify(oldVal) === JSON.stringify(newVal)) return;
+    changes.push({ field: k2, oldValue: oldVal, newValue: newVal });
+  });
+  if (changes.length > 0) {
+    logChanges("song", id, songTitle, viewerName, changes);
+  }
 }
 async function deleteOneSongFromSupabase(id) {
   var client = getSupabaseClient();
@@ -845,6 +887,93 @@ async function saveOriginalsOrderToSupabase(order) {
   );
   if (res.error) throw new Error(res.error.message);
 }
+const CHANGE_LOG_MAX_VALUE_BYTES = 1024;
+const CHANGE_LOG_RETENTION_DAYS = 7;
+function truncateForLog(val) {
+  if (val == null) return null;
+  var s = typeof val === "string" ? val : JSON.stringify(val);
+  if (s.length > CHANGE_LOG_MAX_VALUE_BYTES) return s.slice(0, CHANGE_LOG_MAX_VALUE_BYTES) + "\u2026[truncated]";
+  return val;
+}
+function logChanges(targetType, targetId, targetName, who, changes) {
+  try {
+    var client = getSupabaseClient();
+    if (!client || !changes || changes.length === 0) return;
+    var rows = changes.map(function(c) {
+      return {
+        target_type: targetType,
+        target_id: targetId,
+        target_name: targetName || null,
+        who: who || null,
+        field: c.field,
+        old_value: truncateForLog(c.oldValue),
+        new_value: truncateForLog(c.newValue)
+      };
+    });
+    client.from("change_log").insert(rows).then(function(res) {
+      if (res.error) console.warn("change_log insert failed:", res.error.message);
+    });
+  } catch (e) {
+    console.warn("change_log error:", e);
+  }
+}
+function pruneChangeLog() {
+  try {
+    var client = getSupabaseClient();
+    if (!client) return;
+    var cutoff = new Date(Date.now() - CHANGE_LOG_RETENTION_DAYS * 24 * 60 * 60 * 1e3).toISOString();
+    client.from("change_log").delete().lt("created_at", cutoff).then(function(res) {
+      if (res.error) console.warn("change_log prune failed:", res.error.message);
+    });
+  } catch (e) {
+  }
+}
+async function fetchSongChangeLog(songId) {
+  var client = getSupabaseClient();
+  if (!client) return [];
+  var res = await client.from("change_log").select("*").eq("target_type", "song").eq("target_id", songId).order("created_at", { ascending: false }).limit(100);
+  if (res.error) {
+    console.warn("change_log fetch failed:", res.error.message);
+    return [];
+  }
+  var coalesced = [];
+  (res.data || []).forEach(function(entry) {
+    var prev = coalesced[coalesced.length - 1];
+    if (prev && prev.who === entry.who && prev.field === entry.field) {
+      var gap = new Date(prev.created_at).getTime() - new Date(entry.created_at).getTime();
+      if (gap < 6e4) {
+        prev.old_value = entry.old_value;
+        prev._coalesced = (prev._coalesced || 1) + 1;
+        return;
+      }
+    }
+    coalesced.push({ ...entry });
+  });
+  return coalesced;
+}
+async function fetchGlobalChangeLog() {
+  var client = getSupabaseClient();
+  if (!client) return [];
+  var res = await client.from("change_log").select("*").eq("target_type", "song").order("created_at", { ascending: false }).limit(50);
+  if (res.error) {
+    console.warn("change_log fetch failed:", res.error.message);
+    return [];
+  }
+  var coalesced = [];
+  (res.data || []).forEach(function(entry) {
+    var prev = coalesced[coalesced.length - 1];
+    if (prev && prev.who === entry.who && prev.field === entry.field && prev.target_id === entry.target_id) {
+      var gap = new Date(prev.created_at).getTime() - new Date(entry.created_at).getTime();
+      if (gap < 6e4) {
+        prev.old_value = entry.old_value;
+        prev._coalesced = (prev._coalesced || 1) + 1;
+        return;
+      }
+    }
+    coalesced.push({ ...entry });
+  });
+  return coalesced;
+}
 function loadPersonalPrefs() {
   let activeViewId = null;
   let activeSetlistId = null;
@@ -913,9 +1042,9 @@ async function loadAllData() {
     throw err;
   }
 }
-function saveOneSongRemote(patch) {
+function saveOneSongRemote(patch, viewerName) {
   return supabaseCall("saveSongPatch", function() {
-    return saveSongPatchToSupabase(patch);
+    return saveSongPatchToSupabase(patch, viewerName);
   });
 }
 function deleteOneSongRemote(id) {
@@ -1057,6 +1186,12 @@ function App() {
   const [driveReview, setDriveReview] = useState({ duplicates: [], ambiguous: [], unmatched: [], applied: 0, alreadyLinked: 0 });
   const [showDriveReviewScreen, setShowDriveReviewScreen] = useState(false);
   const [showDriveFolderSettings, setShowDriveFolderSettings] = useState(false);
+  const [showRecentEdits, setShowRecentEdits] = useState(false);
+  const undoStackRef = useRef([]);
+  const redoStackRef = useRef([]);
+  const [undoLen, setUndoLen] = useState(0);
+  const [redoLen, setRedoLen] = useState(0);
+  const isUndoRedoRef = useRef(false);
   const [driveFolderUrl, setDriveFolderUrl] = useState("");
   const [arrColPct, setArrColPct] = useState(50);
   const [loaded, setLoaded] = useState(false);
@@ -1066,6 +1201,14 @@ function App() {
   const [activeTab, setActiveTab] = useState("Setlist");
   const [query, setQuery] = useState("");
   const searchInputRef = useRef(null);
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2e3);
+  }, []);
+  const [showCopySheet, setShowCopySheet] = useState(false);
   const [openId, setOpenId] = useState(null);
   const [pendingRestore, setPendingRestore] = useState(null);
   const songUiStateRef = useRef({ collapsed: null, scrollTop: 0 });
@@ -1244,7 +1387,8 @@ function App() {
     const patchBeingSaved = entry.pendingPatch;
     songSaveTimers.current[id] = { ...entry, inFlight: true, inFlightSince: Date.now() };
     setSaveState("saving");
-    saveOneSongRemote(patchBeingSaved).then(() => {
+    var viewerName = views && views[activeViewId] ? views[activeViewId].name : null;
+    saveOneSongRemote(patchBeingSaved, viewerName).then(() => {
       reportSaveSuccess();
       const current = songSaveTimers.current[id];
       if (!current) return;
@@ -1470,6 +1614,7 @@ function App() {
         if (cancelled) return;
         if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
         setIsBeta(!!data.isBeta);
+        pruneChangeLog();
         let recovered = null;
         if (!usedCache) {
           try {
@@ -1952,8 +2097,46 @@ function App() {
     viewsSaveTimer.current = setTimeout(attemptViewsSave, 300);
   }
   function updateSong(id, patch) {
+    if (!isUndoRedoRef.current) {
+      var currentSong = songsRef.current && songsRef.current.find(function(s) {
+        return s.id === id;
+      });
+      if (currentSong) {
+        for (var k in patch) {
+          if (k === "id") continue;
+          if (JSON.stringify(currentSong[k]) !== JSON.stringify(patch[k])) {
+            undoStackRef.current = undoStackRef.current.concat({ songId: id, field: k, oldValue: currentSong[k], newValue: patch[k] });
+          }
+        }
+        redoStackRef.current = [];
+        setUndoLen(undoStackRef.current.length);
+        setRedoLen(0);
+      }
+    }
     setSongs((prev) => prev.map((s) => s.id === id ? { ...s, ...patch } : s));
     scheduleSongSave(id, patch);
+  }
+  function performUndo() {
+    if (undoStackRef.current.length === 0) return;
+    var entry = undoStackRef.current[undoStackRef.current.length - 1];
+    undoStackRef.current = undoStackRef.current.slice(0, -1);
+    redoStackRef.current = redoStackRef.current.concat(entry);
+    setUndoLen(undoStackRef.current.length);
+    setRedoLen(redoStackRef.current.length);
+    isUndoRedoRef.current = true;
+    updateSong(entry.songId, Object.fromEntries([[entry.field, entry.oldValue]]));
+    isUndoRedoRef.current = false;
+  }
+  function performRedo() {
+    if (redoStackRef.current.length === 0) return;
+    var entry = redoStackRef.current[redoStackRef.current.length - 1];
+    redoStackRef.current = redoStackRef.current.slice(0, -1);
+    undoStackRef.current = undoStackRef.current.concat(entry);
+    setUndoLen(undoStackRef.current.length);
+    setRedoLen(redoStackRef.current.length);
+    isUndoRedoRef.current = true;
+    updateSong(entry.songId, Object.fromEntries([[entry.field, entry.newValue]]));
+    isUndoRedoRef.current = false;
   }
   const songsById = useMemo(() => songs ? Object.fromEntries(songs.map((s) => [s.id, s])) : {}, [songs]);
   const activeSetlist = useMemo(
@@ -2226,7 +2409,26 @@ function App() {
       onOpenDriveReview: () => setShowDriveReviewScreen(true),
       views,
       activeViewId,
-      onSelectView: selectView
+      onSelectView: selectView,
+      onOpenRecentEdits: () => setShowRecentEdits(true),
+      canUndo: undoLen > 0,
+      canRedo: redoLen > 0,
+      onUndo: performUndo,
+      onRedo: performRedo,
+      onCopySetlist: activeSetlist ? () => setShowCopySheet(true) : null
+    }
+  ), showRecentEdits && /* @__PURE__ */ React.createElement(
+    GlobalUndoHistoryModal,
+    {
+      onUndo: (revertPatch) => {
+        var songId = revertPatch.id;
+        var fieldPatch = {};
+        for (var k in revertPatch) {
+          if (k !== "id") fieldPatch[k] = revertPatch[k];
+        }
+        updateSong(songId, fieldPatch);
+      },
+      onClose: () => setShowRecentEdits(false)
     }
   ), showDriveReviewScreen && /* @__PURE__ */ React.createElement(
     DriveReviewScreen,
@@ -2411,6 +2613,10 @@ function App() {
         return null;
       })(),
       onSetAssignment: (targetSetName) => moveSongToSet(openSong.id, targetSetName),
+      canUndo: undoLen > 0,
+      canRedo: redoLen > 0,
+      onUndo: performUndo,
+      onRedo: performRedo,
       knownTags,
       onTagsChange: (newTag) => {
         setKnownTags((prev) => {
@@ -2484,7 +2690,22 @@ function App() {
         setShowViewPicker(false);
       }
     }
-  ), /* @__PURE__ */ React.createElement(UploadToast, { upload: bgUpload, onRetry: retryBgUpload, onDismiss: dismissBgUpload })));
+  ), showCopySheet && /* @__PURE__ */ React.createElement(
+    CopySetlistSheet,
+    {
+      sectionOrder: slSectionOrder,
+      songOrder: slSongOrder,
+      songsById,
+      onCopy: (text) => {
+        setShowCopySheet(false);
+        navigator.clipboard.writeText(text).then(
+          () => showToast("Setlist copied"),
+          () => showToast("Copy failed")
+        );
+      },
+      onClose: () => setShowCopySheet(false)
+    }
+  ), /* @__PURE__ */ React.createElement(UploadToast, { upload: bgUpload, onRetry: retryBgUpload, onDismiss: dismissBgUpload }), toast && /* @__PURE__ */ React.createElement("div", { style: styles.toast }, toast)));
 }
 function ViewPickerModal({ views, currentViewId, onPick }) {
   return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop }, /* @__PURE__ */ React.createElement("div", { style: styles.modalCard }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, "Who's viewing?"), /* @__PURE__ */ React.createElement("div", { style: styles.modalSubtitle }, "Pick your view for this session."), /* @__PURE__ */ React.createElement("div", { style: styles.viewPickerList }, VIEW_IDS.map((vid) => {
@@ -2502,7 +2723,7 @@ function ViewPickerModal({ views, currentViewId, onPick }) {
     );
   }))));
 }
-function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRefreshing, onBeforeReload, openTodoCount, onOpenTodoScreen, lastSaveError, driveNeedsAttentionCount, onOpenDriveReview, views, activeViewId, onSelectView }) {
+function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRefreshing, onBeforeReload, openTodoCount, onOpenTodoScreen, lastSaveError, driveNeedsAttentionCount, onOpenDriveReview, views, activeViewId, onSelectView, onOpenRecentEdits, canUndo, canRedo, onUndo, onRedo, onCopySetlist }) {
   const [showMenu, setShowMenu] = useState(false);
   const [showZoomControl, setShowZoomControl] = useState(false);
   useCloseMenuOnOutsideClick(showMenu, () => setShowMenu(false));
@@ -2540,6 +2761,52 @@ function Header({ isBeta, saveState, syncStatus, onRefresh, refreshing, manualRe
     },
     "Review Drive links",
     driveNeedsAttentionCount > 0 && /* @__PURE__ */ React.createElement("span", { style: styles.driveMenuBadge }, driveNeedsAttentionCount)
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        onUndo();
+        setShowMenu(false);
+      },
+      disabled: !canUndo,
+      style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8, opacity: canUndo ? 1 : 0.35 }
+    },
+    /* @__PURE__ */ React.createElement(Icon, { name: "undo", size: 14, color: "var(--dim)" }),
+    "Undo"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        onRedo();
+        setShowMenu(false);
+      },
+      disabled: !canRedo,
+      style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8, opacity: canRedo ? 1 : 0.35 }
+    },
+    /* @__PURE__ */ React.createElement(Icon, { name: "redo", size: 14, color: "var(--dim)" }),
+    "Redo"
+  ), /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        onOpenRecentEdits();
+        setShowMenu(false);
+      },
+      style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8 }
+    },
+    /* @__PURE__ */ React.createElement(Icon, { name: "clock", size: 14, color: "var(--dim)" }),
+    "Recent edits"
+  ), onCopySetlist && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        onCopySetlist();
+        setShowMenu(false);
+      },
+      style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8 }
+    },
+    /* @__PURE__ */ React.createElement(Icon, { name: "clipboard", size: 14, color: "var(--dim)" }),
+    "Copy setlist"
   ), /* @__PURE__ */ React.createElement(
     "button",
     {
@@ -2701,6 +2968,57 @@ function SetlistBar({ setlist, counts, sectionOrder, setBreaks, expanded, onTogg
     /* @__PURE__ */ React.createElement("div", { style: { ...styles.slStatNum, ...c.accent ? styles.slStatNumAccent : {} } }, c.num),
     /* @__PURE__ */ React.createElement("div", { style: styles.slStatLabel }, c.label)
   ))), setlist && setlist.notes ? /* @__PURE__ */ React.createElement("div", { style: styles.slBarNotes }, /* @__PURE__ */ React.createElement("div", { style: styles.slBarNotesLbl }, "Notes"), /* @__PURE__ */ React.createElement("div", { style: styles.slBarNotesTxt }, setlist.notes)) : null, /* @__PURE__ */ React.createElement("div", { style: styles.slBarActions }, /* @__PURE__ */ React.createElement("button", { style: styles.slBarActBtn, onClick: onEdit, disabled: !setlist }, /* @__PURE__ */ React.createElement(Icon, { name: "pencil", size: 13, color: "var(--text)" }), "Edit Show Details"), /* @__PURE__ */ React.createElement("button", { style: { ...styles.slBarActBtn, ...styles.slBarActBtnGold }, onClick: onSwitch }, /* @__PURE__ */ React.createElement(Icon, { name: "shuffle", size: 13, color: "var(--gold)" }), "Switch Shows"))));
+}
+const COPY_FORMATS = [
+  { id: "titles", label: "Titles only", format: (s) => s.title || "Untitled" },
+  { id: "features", label: "With features", format: (s) => {
+    let t = s.title || "Untitled";
+    if (s.features) t += " \u2014 Feat. " + s.features;
+    return t;
+  } },
+  { id: "instruments", label: "With instruments", format: (s) => {
+    let t = s.title || "Untitled";
+    if (s.alexInstrument) t += " \u2014 " + s.alexInstrument;
+    return t;
+  } },
+  { id: "tempo", label: "With tempo", format: (s) => {
+    let t = s.title || "Untitled";
+    const parts = [];
+    if (s.tempo) parts.push(s.tempo + " BPM");
+    if (s.timeSig) parts.push(s.timeSig);
+    if (parts.length) t += " \u2014 " + parts.join(", ");
+    return t;
+  } },
+  { id: "key", label: "With key", format: (s) => {
+    let t = s.title || "Untitled";
+    if (s.key) t += " \u2014 " + s.key;
+    return t;
+  } }
+];
+function CopySetlistSheet({ sectionOrder, songOrder, songsById, onCopy, onClose }) {
+  function buildText(fmt) {
+    const setNames = (sectionOrder || []).filter((n) => n !== "Not In Show");
+    const multiSet = setNames.length > 1;
+    const lines = [];
+    setNames.forEach((sec) => {
+      if (multiSet) lines.push(sec);
+      (songOrder[sec] || []).forEach((id, i) => {
+        const s = songsById[id];
+        if (s) lines.push(i + 1 + ". " + fmt.format(s));
+      });
+      if (multiSet) lines.push("");
+    });
+    return lines.join("\n").trimEnd();
+  }
+  return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop, onClick: onClose }, /* @__PURE__ */ React.createElement("div", { style: { ...styles.modalCard, maxWidth: 320 }, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, "Copy setlist"), /* @__PURE__ */ React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6, marginTop: 10 } }, COPY_FORMATS.map((fmt) => /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      key: fmt.id,
+      onClick: () => onCopy(buildText(fmt)),
+      style: styles.copyFormatBtn
+    },
+    fmt.label
+  )))));
 }
 function SetlistSwitchSheet({ setlists, activeId, defaultId, onPick, onSetDefault, onEditCurrent, onNew, onClose }) {
   const dated = setlists.filter((s) => s.date).sort((a, b) => String(a.date).localeCompare(String(b.date)));
@@ -2874,10 +3192,10 @@ function SetlistView({ songs, sectionOrder, songOrder, setBreaks, onOpen, onSong
       style: styles.sectionMenuItem
     },
     editMode ? "Done editing order" : "Edit order"
-  ))), editMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startHeaderDrag(sec), style: styles.dragHandle }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 16, color: "var(--dim)" }))), (localSongOrder[sec] || []).map((id) => {
+  ))), editMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startHeaderDrag(sec), style: styles.dragHandle }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 16, color: "var(--dim)" }))), (localSongOrder[sec] || []).map((id, songIdx) => {
     const s = songsById[id];
     if (!s) return null;
-    return /* @__PURE__ */ React.createElement("div", { key: id, ref: setRowRef("song:" + id), style: { ...styles.dragRow, ...activeDragId === "song:" + id ? styles.dragging : {} } }, editMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startSongDrag(id), style: styles.dragHandle }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 16, color: "var(--dim)" })), /* @__PURE__ */ React.createElement("button", { onClick: () => onOpen(id), style: styles.rowMain }, /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, background: getDotColor(s) } }), /* @__PURE__ */ React.createElement(SongTitleAndFeatures, { song: s })), editMode && onRemoveFromSetlist && /* @__PURE__ */ React.createElement(
+    return /* @__PURE__ */ React.createElement("div", { key: id, ref: setRowRef("song:" + id), style: { ...styles.dragRow, ...activeDragId === "song:" + id ? styles.dragging : {} } }, editMode && /* @__PURE__ */ React.createElement("span", { onPointerDown: startSongDrag(id), style: styles.dragHandle }, /* @__PURE__ */ React.createElement(Icon, { name: "grip", size: 16, color: "var(--dim)" })), /* @__PURE__ */ React.createElement("button", { onClick: () => onOpen(id), style: styles.rowMain }, /* @__PURE__ */ React.createElement("span", { style: styles.songNum }, songIdx + 1), /* @__PURE__ */ React.createElement("span", { style: { ...styles.dot, background: getDotColor(s) } }), /* @__PURE__ */ React.createElement(SongTitleAndFeatures, { song: s })), editMode && onRemoveFromSetlist && /* @__PURE__ */ React.createElement(
       "button",
       {
         onClick: () => onRemoveFromSetlist(id),
@@ -4538,6 +4856,153 @@ function AllSongsTodoScreen({ songs, personName, personField, onUpdateSong, onCl
     /* @__PURE__ */ React.createElement("div", { style: styles.todoScreenBody }, activeItems.map((it) => renderTodoRow(it, true)), activeItems.length === 0 && /* @__PURE__ */ React.createElement("div", { style: styles.todoScreenEmpty }, "Nothing here."), hiddenCount > 0 && /* @__PURE__ */ React.createElement(React.Fragment, null, /* @__PURE__ */ React.createElement("button", { onClick: () => setShowCompleted((v) => !v), style: styles.todoShowCompleted }, showCompleted ? "Hide completed" : `Show completed (${hiddenCount})`), showCompleted && /* @__PURE__ */ React.createElement("div", { style: styles.todoCompletedGroup }, /* @__PURE__ */ React.createElement("div", { style: styles.todoCompletedLabel }, "Completed"), completedItems.map((it) => renderTodoRow(it, false)))))
   );
 }
+function fieldLabel(field) {
+  if (field === "title") return "Title";
+  if (field === "key") return "Key";
+  if (field === "dotColor") return "Status dot";
+  if (field === "section") return "Set assignment";
+  if (field === "tempo") return "Tempo";
+  if (field === "timeSig") return "Time signature";
+  var def = BUILTIN_SECTION_DEFS.find(function(d) {
+    return d.id === field;
+  });
+  if (def) return def.label;
+  return field.replace(/([A-Z])/g, " $1").replace(/^./, function(s) {
+    return s.toUpperCase();
+  }).trim();
+}
+function valuePreview(val) {
+  if (val == null || val === "") return "(empty)";
+  if (typeof val === "string") {
+    if (val.indexOf("[truncated]") !== -1) return val.slice(0, 80) + "\u2026";
+    return val.length > 80 ? val.slice(0, 80) + "\u2026" : val;
+  }
+  if (Array.isArray(val)) return val.length + " item" + (val.length === 1 ? "" : "s");
+  return JSON.stringify(val).slice(0, 80);
+}
+function timeAgo(dateStr) {
+  var diff = Date.now() - new Date(dateStr).getTime();
+  var mins = Math.floor(diff / 6e4);
+  if (mins < 1) return "just now";
+  if (mins < 60) return mins + "m ago";
+  var hrs = Math.floor(mins / 60);
+  if (hrs < 24) return hrs + "h ago";
+  var days = Math.floor(hrs / 24);
+  if (days === 1) return "yesterday";
+  return days + "d ago";
+}
+function UndoHistoryModal({ songId, songTitle, onUndo, onClose }) {
+  const [entries, setEntries] = useState(null);
+  const [undoing, setUndoing] = useState(null);
+  const [undone, setUndone] = useState(/* @__PURE__ */ new Set());
+  useEffect(() => {
+    var cancelled = false;
+    fetchSongChangeLog(songId).then(function(data) {
+      if (!cancelled) setEntries(data);
+    });
+    return function() {
+      cancelled = true;
+    };
+  }, [songId]);
+  function handleUndo(entry) {
+    setUndoing(entry.id);
+    var revertPatch = {};
+    revertPatch[entry.field] = entry.old_value;
+    onUndo(revertPatch);
+    setUndone(function(prev) {
+      var next = new Set(prev);
+      next.add(entry.id);
+      return next;
+    });
+    setUndoing(null);
+  }
+  var hasEntries = entries && entries.length > 0;
+  return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop, onClick: onClose }, /* @__PURE__ */ React.createElement("div", { style: { ...styles.modalCard, maxWidth: 380, maxHeight: "80vh", display: "flex", flexDirection: "column" }, onClick: function(e) {
+    e.stopPropagation();
+  } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, /* @__PURE__ */ React.createElement(Icon, { name: "clock", size: 15, color: "var(--dim)", style: { marginRight: 6, verticalAlign: "-2px" } }), "Edit History"), songTitle && /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "var(--dim)", marginTop: 2 } }, songTitle)), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { ...styles.metaIconBtn, padding: 4 }, "aria-label": "Close" }, /* @__PURE__ */ React.createElement(Icon, { name: "x", size: 16, color: "var(--dim)" }))), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, overflowY: "auto", margin: "0 -6px", padding: "0 6px" } }, entries === null ? /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", padding: 20, color: "var(--dim)", fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { name: "loader", size: 18, color: "var(--dim)", className: "spin" })) : !hasEntries ? /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", padding: 20, color: "var(--dim)", fontSize: 13 } }, "No recent changes to undo.") : entries.map(function(entry) {
+    var isUndone = undone.has(entry.id);
+    return /* @__PURE__ */ React.createElement("div", { key: entry.id, style: { borderBottom: "1px solid var(--line)", padding: "10px 0" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text)", fontFamily: "var(--display)" } }, fieldLabel(entry.field)), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "var(--dim)", marginTop: 2 } }, entry.who ? entry.who + " \xB7 " : "", timeAgo(entry.created_at)), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "var(--dim)", marginTop: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--needs)", fontFamily: "var(--mono)", fontSize: 11 } }, "\u2212"), " ", /* @__PURE__ */ React.createElement("span", { style: { opacity: 0.7 } }, valuePreview(entry.old_value))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "var(--dim)", marginTop: 1 } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--ready)", fontFamily: "var(--mono)", fontSize: 11 } }, "+"), " ", /* @__PURE__ */ React.createElement("span", { style: { opacity: 0.7 } }, valuePreview(entry.new_value)))), !isUndone ? /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: function() {
+          handleUndo(entry);
+        },
+        disabled: undoing === entry.id,
+        style: {
+          background: "none",
+          border: "1px solid var(--line)",
+          borderRadius: 6,
+          padding: "4px 10px",
+          fontSize: 11,
+          color: "var(--gold)",
+          cursor: "pointer",
+          fontWeight: 600,
+          whiteSpace: "nowrap",
+          marginTop: 2,
+          fontFamily: "var(--display)"
+        }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "undo", size: 11, color: "var(--gold)", style: { marginRight: 3, verticalAlign: "-1px" } }),
+      "Undo"
+    ) : /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "var(--ready)", fontWeight: 600, marginTop: 6, fontFamily: "var(--display)" } }, /* @__PURE__ */ React.createElement(Icon, { name: "check", size: 11, color: "var(--ready)", style: { marginRight: 2, verticalAlign: "-1px" } }), " Undone")));
+  }))));
+}
+function GlobalUndoHistoryModal({ onUndo, onClose }) {
+  const [entries, setEntries] = useState(null);
+  const [undoing, setUndoing] = useState(null);
+  const [undone, setUndone] = useState(/* @__PURE__ */ new Set());
+  useEffect(() => {
+    var cancelled = false;
+    fetchGlobalChangeLog().then(function(data) {
+      if (!cancelled) setEntries(data);
+    });
+    return function() {
+      cancelled = true;
+    };
+  }, []);
+  function handleUndo(entry) {
+    setUndoing(entry.id);
+    var revertPatch = { id: entry.target_id };
+    revertPatch[entry.field] = entry.old_value;
+    onUndo(revertPatch);
+    setUndone(function(prev) {
+      var next = new Set(prev);
+      next.add(entry.id);
+      return next;
+    });
+    setUndoing(null);
+  }
+  var hasEntries = entries && entries.length > 0;
+  return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop, onClick: onClose }, /* @__PURE__ */ React.createElement("div", { style: { ...styles.modalCard, maxWidth: 380, maxHeight: "80vh", display: "flex", flexDirection: "column" }, onClick: function(e) {
+    e.stopPropagation();
+  } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 } }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, /* @__PURE__ */ React.createElement(Icon, { name: "clock", size: 15, color: "var(--dim)", style: { marginRight: 6, verticalAlign: "-2px" } }), "Recent Edits"), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { ...styles.metaIconBtn, padding: 4 }, "aria-label": "Close" }, /* @__PURE__ */ React.createElement(Icon, { name: "x", size: 16, color: "var(--dim)" }))), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, overflowY: "auto", margin: "0 -6px", padding: "0 6px" } }, entries === null ? /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", padding: 20, color: "var(--dim)", fontSize: 13 } }, /* @__PURE__ */ React.createElement(Icon, { name: "loader", size: 18, color: "var(--dim)", className: "spin" })) : !hasEntries ? /* @__PURE__ */ React.createElement("div", { style: { textAlign: "center", padding: 20, color: "var(--dim)", fontSize: 13 } }, "No recent edits.") : entries.map(function(entry) {
+    var isUndone = undone.has(entry.id);
+    return /* @__PURE__ */ React.createElement("div", { key: entry.id, style: { borderBottom: "1px solid var(--line)", padding: "10px 0" } }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 8 } }, /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: "var(--text)", fontFamily: "var(--display)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, entry.target_name || "Unknown song", " \u2014 ", fieldLabel(entry.field)), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11, color: "var(--dim)", marginTop: 2 } }, entry.who ? entry.who + " \xB7 " : "", timeAgo(entry.created_at)), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "var(--dim)", marginTop: 4 } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--needs)", fontFamily: "var(--mono)", fontSize: 11 } }, "\u2212"), " ", /* @__PURE__ */ React.createElement("span", { style: { opacity: 0.7 } }, valuePreview(entry.old_value))), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 12, color: "var(--dim)", marginTop: 1 } }, /* @__PURE__ */ React.createElement("span", { style: { color: "var(--ready)", fontFamily: "var(--mono)", fontSize: 11 } }, "+"), " ", /* @__PURE__ */ React.createElement("span", { style: { opacity: 0.7 } }, valuePreview(entry.new_value)))), !isUndone ? /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: function() {
+          handleUndo(entry);
+        },
+        disabled: undoing === entry.id,
+        style: {
+          background: "none",
+          border: "1px solid var(--line)",
+          borderRadius: 6,
+          padding: "4px 10px",
+          fontSize: 11,
+          color: "var(--gold)",
+          cursor: "pointer",
+          fontWeight: 600,
+          whiteSpace: "nowrap",
+          marginTop: 2,
+          fontFamily: "var(--display)"
+        }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "undo", size: 11, color: "var(--gold)", style: { marginRight: 3, verticalAlign: "-1px" } }),
+      "Undo"
+    ) : /* @__PURE__ */ React.createElement("span", { style: { fontSize: 11, color: "var(--ready)", fontWeight: 600, marginTop: 6, fontFamily: "var(--display)" } }, /* @__PURE__ */ React.createElement(Icon, { name: "check", size: 11, color: "var(--ready)", style: { marginRight: 2, verticalAlign: "-1px" } }), " Undone")));
+  }))));
+}
 function SongDetail({
   song,
   onChange,
@@ -4574,6 +5039,10 @@ function SongDetail({
   setNames,
   songSetName,
   onSetAssignment,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
   knownTags,
   onTagsChange
 }) {
@@ -4607,6 +5076,7 @@ function SongDetail({
   const [showMetaMenu, setShowMetaMenu] = useState(false);
   const [showDotPicker, setShowDotPicker] = useState(false);
   const [openMenuFor, setOpenMenuFor] = useState(null);
+  const [showUndoHistory, setShowUndoHistory] = useState(false);
   useCloseMenuOnOutsideClick(showMetaMenu, () => setShowMetaMenu(false));
   useCloseMenuOnOutsideClick(openMenuFor !== null, () => setOpenMenuFor(null));
   const [renamingSectionId, setRenamingSectionId] = useState(null);
@@ -4836,6 +5306,41 @@ function SongDetail({
         style: styles.sectionMenuItem
       },
       "Zoom"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => {
+          onUndo();
+          setShowMetaMenu(false);
+        },
+        disabled: !canUndo,
+        style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8, opacity: canUndo ? 1 : 0.35 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "undo", size: 14, color: "var(--dim)" }),
+      "Undo"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => {
+          onRedo();
+          setShowMetaMenu(false);
+        },
+        disabled: !canRedo,
+        style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8, opacity: canRedo ? 1 : 0.35 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "redo", size: 14, color: "var(--dim)" }),
+      "Redo"
+    ), /* @__PURE__ */ React.createElement(
+      "button",
+      {
+        onClick: () => {
+          setShowUndoHistory(true);
+          setShowMetaMenu(false);
+        },
+        style: { ...styles.sectionMenuItem, display: "flex", alignItems: "center", gap: 8 }
+      },
+      /* @__PURE__ */ React.createElement(Icon, { name: "clock", size: 14, color: "var(--dim)" }),
+      "Edit history"
     ), /* @__PURE__ */ React.createElement("button", { onClick: () => setConfirmDelete(true), style: { ...styles.sectionMenuItem, color: "var(--needs)" } }, "Delete song")))))),
     /* @__PURE__ */ React.createElement("div", { style: styles.songTabBar }, SONG_DETAIL_TABS.map((t) => /* @__PURE__ */ React.createElement(
       "button",
@@ -5053,6 +5558,18 @@ function SongDetail({
       }
     ),
     showZoomControl && /* @__PURE__ */ React.createElement(ZoomControl, { onBeforeReload, onClose: () => setShowZoomControl(false) }),
+    showUndoHistory && /* @__PURE__ */ React.createElement(
+      UndoHistoryModal,
+      {
+        songId: song.id,
+        songTitle: song.title,
+        onUndo: (revertPatch) => {
+          onChange(revertPatch);
+          onFieldBlur && onFieldBlur(song.id);
+        },
+        onClose: () => setShowUndoHistory(false)
+      }
+    ),
     showTagPicker && /* @__PURE__ */ React.createElement(
       TagPickerSheet,
       {
@@ -5159,6 +5676,7 @@ const rawStyles = {
   dragRow: { display: "flex", alignItems: "center", gap: 4, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 12, padding: "5px 8px 5px 4px" },
   rowMain: { flex: 1, display: "flex", alignItems: "center", gap: 12, background: "transparent", border: "none", cursor: "pointer", textAlign: "left", padding: "9px 6px" },
   dragHandle: { padding: "4px 6px", touchAction: "none", cursor: "grab", display: "flex", alignItems: "center", flexShrink: 0 },
+  songNum: { fontFamily: "var(--mono)", fontSize: 13, color: "var(--dim)", minWidth: 18, textAlign: "right", flexShrink: 0 },
   dot: { width: 9, height: 9, borderRadius: "50%", flexShrink: 0, boxShadow: "0 0 6px currentColor" },
   rowTitleFeaturesWrap: { flex: 1, minWidth: 0, display: "flex", flexWrap: "wrap", alignItems: "baseline", columnGap: 8, rowGap: 1 },
   rowTitle: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 20.5, color: "var(--text)", letterSpacing: "0.01em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
@@ -5213,6 +5731,7 @@ const rawStyles = {
   sectionDivider: { display: "flex", alignItems: "center", gap: 8, padding: "12px 6px 6px" },
   sectionDividerLabel: { fontFamily: "var(--display)", fontWeight: 600, fontSize: 13, letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--gold)", flex: 1 },
   sectionDividerCount: { fontFamily: "var(--mono)", fontSize: 11, color: "var(--dim)" },
+  toast: { position: "absolute", bottom: 84, left: "50%", transform: "translateX(-50%)", background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 10, padding: "8px 18px", fontFamily: "var(--body)", fontSize: 14, color: "var(--text)", boxShadow: "0 4px 14px rgba(0,0,0,0.4)", zIndex: 100, whiteSpace: "nowrap" },
   fab: { position: "absolute", right: 18, bottom: 22, width: 52, height: 52, borderRadius: "50%", background: "var(--gold)", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 6px 18px rgba(227,168,59,0.35)" },
   detailWrap: { position: "absolute", inset: 0, background: "var(--bg)", display: "flex", flexDirection: "column", touchAction: "pan-y" },
   detailTopBar: { display: "flex", alignItems: "flex-start", gap: 6, padding: "12px 12px 10px", borderBottom: "1px solid var(--line)", position: "relative" },
@@ -5394,6 +5913,7 @@ const rawStyles = {
   modalTitle: { fontFamily: "var(--display)", fontWeight: 700, fontSize: 17, color: "var(--text)", marginBottom: 4 },
   modalSubtitle: { fontSize: 12.5, color: "var(--dim)", marginBottom: 14 },
   viewPickerList: { display: "flex", flexDirection: "column", gap: 8 },
+  copyFormatBtn: { display: "block", width: "100%", textAlign: "left", background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 10, padding: "12px 14px", color: "var(--text)", fontFamily: "var(--body)", fontSize: 14.5, cursor: "pointer" },
   viewPickerOption: { display: "block", width: "100%", textAlign: "left", background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 10, padding: "13px 14px", color: "var(--text)", fontFamily: "var(--display)", fontWeight: 600, fontSize: 15, cursor: "pointer" },
   viewPickerOptionActive: { borderColor: "var(--gold)", color: "var(--gold)", background: "rgba(227,168,59,0.1)" },
   modalOption: { display: "block", width: "100%", textAlign: "left", background: "var(--surface-raised)", border: "1px solid var(--line)", borderRadius: 10, padding: 12, marginBottom: 10, cursor: "pointer" },
