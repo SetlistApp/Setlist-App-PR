@@ -510,14 +510,26 @@ function defaultViews(allIds) {
   });
   return views;
 }
-const CACHE_KEY = "bandSetlist_cache";
-const PREF_VIEW_KEY = "bandSetlist_activeViewId";
-const PREF_SETLIST_KEY = "bandSetlist_activeSetlistId";
-const PREF_LAST_SEEN_DEFAULT_KEY = "bandSetlist_lastSeenDefaultId";
+function storageChannel() {
+  return typeof window !== "undefined" && window.__SUPABASE_CHANNEL__ || "default";
+}
+function storageKey(base, channel) {
+  return base + "_" + channel;
+}
+const LEGACY_CACHE_KEY = "bandSetlist_cache";
+const LEGACY_PREF_VIEW_KEY = "bandSetlist_activeViewId";
+const LEGACY_PREF_SETLIST_KEY = "bandSetlist_activeSetlistId";
+const LEGACY_PREF_LAST_SEEN_DEFAULT_KEY = "bandSetlist_lastSeenDefaultId";
+const LEGACY_RELOAD_SNAPSHOT_KEY = "bandSetlist_reloadSnapshot";
+const LEGACY_PENDING_EDITS_KEY = "bandSetlist_pendingEdits";
+const CACHE_KEY = storageKey(LEGACY_CACHE_KEY, storageChannel());
+const PREF_VIEW_KEY = storageKey(LEGACY_PREF_VIEW_KEY, storageChannel());
+const PREF_SETLIST_KEY = storageKey(LEGACY_PREF_SETLIST_KEY, storageChannel());
+const PREF_LAST_SEEN_DEFAULT_KEY = storageKey(LEGACY_PREF_LAST_SEEN_DEFAULT_KEY, storageChannel());
 const PREF_ARR_COL_KEY = "bandSetlist_arrColPct";
-const RELOAD_SNAPSHOT_KEY = "bandSetlist_reloadSnapshot";
+const RELOAD_SNAPSHOT_KEY = storageKey(LEGACY_RELOAD_SNAPSHOT_KEY, storageChannel());
 const RELOAD_SNAPSHOT_MAX_AGE_MS = 6e4;
-const PENDING_EDITS_KEY = "bandSetlist_pendingEdits";
+const PENDING_EDITS_KEY = storageKey(LEGACY_PENDING_EDITS_KEY, storageChannel());
 const PENDING_EDITS_MAX_AGE_MS = 24 * 60 * 60 * 1e3;
 const RETRY_DELAY_MS = 3e3;
 const RETRY_MAX_DELAY_MS = 3e4;
@@ -529,7 +541,7 @@ function nextRetryDelay(attempt) {
   const base = Math.min(RETRY_DELAY_MS * Math.pow(2, n), RETRY_MAX_DELAY_MS);
   return base + Math.floor(Math.random() * 2e3);
 }
-const APP_VERSION = "2.0.6";
+const APP_VERSION = "2.0.7";
 var _realtimeStatus = "not configured";
 function readRecoverablePatches(raw, now) {
   try {
@@ -541,8 +553,24 @@ function readRecoverablePatches(raw, now) {
     return null;
   }
 }
-function versionBase(v) {
-  return String(v || "").split("-")[0].split(".").slice(0, 3).join(".");
+function claimLegacyPendingEdits(raw, now, channel) {
+  if (channel !== "sync-prod" || !raw) return null;
+  return readRecoverablePatches(raw, now);
+}
+function shouldClearLegacyPendingEdits(channel) {
+  return channel === "sync-prod";
+}
+function readRecoverableExtras(raw, now) {
+  try {
+    var parsed = JSON.parse(raw);
+    if (!parsed || !parsed.savedAt || now - parsed.savedAt > PENDING_EDITS_MAX_AGE_MS) return { bases: {}, newIds: [] };
+    return {
+      bases: parsed.bases && typeof parsed.bases === "object" ? parsed.bases : {},
+      newIds: Array.isArray(parsed.newIds) ? parsed.newIds : []
+    };
+  } catch (e) {
+    return { bases: {}, newIds: [] };
+  }
 }
 const GS_CALL_TIMEOUT_MS = 14e3;
 const GS_TRANSPORT_EXTRA_MS = 3e4;
@@ -755,63 +783,77 @@ async function loadAllDataFromSupabase() {
     isBeta: channelName.indexOf("beta") !== -1
   };
 }
-async function saveSongPatchToSupabase(patch, viewerName) {
+async function saveSongPatchToSupabase(patch, viewerName, opts) {
+  opts = opts || {};
+  var bases = opts.bases || {};
   var client = getSupabaseClient();
   var id = patch.id;
-  var dbUpdate = {};
-  var customUpdate = {};
-  for (var k in patch) {
-    if (k === "id") continue;
-    if (SUPABASE_SONG_COLUMNS.has(k)) {
-      dbUpdate[k] = patch[k];
-    } else {
-      customUpdate[k] = patch[k];
-    }
-  }
-  var changedFields = Object.keys(patch).filter(function(k2) {
-    return k2 !== "id";
+  var changedFields = Object.keys(patch).filter(function(k) {
+    return k !== "id";
   });
-  var oldValues = {};
-  var songTitle = null;
-  var oldRow = null;
-  if (changedFields.length > 0) {
-    var selectCols = ["title", "customFields"];
-    changedFields.forEach(function(k2) {
-      if (SUPABASE_SONG_COLUMNS.has(k2) && selectCols.indexOf(k2) === -1) selectCols.push(k2);
+  if (changedFields.length === 0) return {};
+  var selectCols = ["title", "customFields", "updated_at"];
+  changedFields.forEach(function(k) {
+    if (SUPABASE_SONG_COLUMNS.has(k) && selectCols.indexOf(k) === -1) selectCols.push(k);
+  });
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var oldRes = await client.from("songs").select(selectCols.join(",")).eq("id", id).maybeSingle();
+    if (oldRes.error) throw new Error(oldRes.error.message);
+    var oldRow = oldRes.data || null;
+    if (!oldRow && !opts.isNew) return { deleted: true };
+    var dbUpdate = {};
+    var customUpdate = {};
+    var merged = {};
+    var finalValues = {};
+    changedFields.forEach(function(k) {
+      var val = patch[k];
+      if (oldRow && SONG_LIST_FIELDS.indexOf(k) !== -1 && Object.prototype.hasOwnProperty.call(bases, k)) {
+        var theirs = SUPABASE_SONG_COLUMNS.has(k) ? oldRow[k] : (oldRow.customFields || {})[k];
+        var m = mergeListThreeWay(bases[k], val, theirs);
+        if (!sameList(m, val)) merged[k] = m;
+        val = m;
+      }
+      finalValues[k] = val;
+      if (SUPABASE_SONG_COLUMNS.has(k)) dbUpdate[k] = val;
+      else customUpdate[k] = val;
     });
-    var oldRes = await client.from("songs").select(selectCols.join(",")).eq("id", id).single();
-    oldRow = oldRes.data || null;
-    if (oldRow) {
-      songTitle = oldRow.title || null;
-      changedFields.forEach(function(k2) {
-        if (SUPABASE_SONG_COLUMNS.has(k2)) {
-          oldValues[k2] = oldRow[k2];
-        } else if (oldRow.customFields) {
-          oldValues[k2] = oldRow.customFields[k2];
-        }
-      });
+    if (Object.keys(customUpdate).length > 0) {
+      dbUpdate.customFields = Object.assign({}, oldRow && oldRow.customFields || {}, customUpdate);
     }
+    dbUpdate.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+    if (!oldRow) {
+      var ins = await client.from("songs").insert(Object.assign({ id }, dbUpdate));
+      if (ins.error) {
+        if (ins.error.code === "23505") {
+          opts = Object.assign({}, opts, { isNew: false });
+          continue;
+        }
+        throw new Error(ins.error.message);
+      }
+      logSongChanges(id, finalValues.title || null, viewerName, changedFields, {}, finalValues);
+      return { merged };
+    }
+    var q = client.from("songs").update(dbUpdate).eq("id", id);
+    if (oldRow.updated_at) q = q.eq("updated_at", oldRow.updated_at);
+    var res = await q.select("id");
+    if (res.error) throw new Error(res.error.message);
+    if (!res.data || res.data.length === 0) continue;
+    var oldValues = {};
+    changedFields.forEach(function(k) {
+      oldValues[k] = SUPABASE_SONG_COLUMNS.has(k) ? oldRow[k] : (oldRow.customFields || {})[k];
+    });
+    logSongChanges(id, oldRow.title || null, viewerName, changedFields, oldValues, finalValues);
+    return { merged };
   }
-  if (Object.keys(customUpdate).length > 0) {
-    var existingCustom = oldRow && oldRow.customFields || {};
-    dbUpdate.customFields = Object.assign({}, existingCustom, customUpdate);
-  }
-  dbUpdate.updated_at = (/* @__PURE__ */ new Date()).toISOString();
-  var res = await client.from("songs").upsert(
-    Object.assign({ id }, dbUpdate),
-    { onConflict: "id" }
-  );
-  if (res.error) throw new Error(res.error.message);
+  throw new Error("Song kept changing during save \u2014 will retry");
+}
+function logSongChanges(id, songTitle, viewerName, fields, oldValues, newValues) {
   var changes = [];
-  changedFields.forEach(function(k2) {
-    var oldVal = oldValues[k2];
-    var newVal = patch[k2];
-    if (JSON.stringify(oldVal) === JSON.stringify(newVal)) return;
-    changes.push({ field: k2, oldValue: oldVal, newValue: newVal });
+  fields.forEach(function(k) {
+    if (JSON.stringify(oldValues[k]) === JSON.stringify(newValues[k])) return;
+    changes.push({ field: k, oldValue: oldValues[k], newValue: newValues[k] });
   });
-  if (changes.length > 0) {
-    logChanges("song", id, songTitle, viewerName, changes);
-  }
+  if (changes.length > 0) logChanges("song", id, songTitle, viewerName, changes);
 }
 async function deleteOneSongFromSupabase(id) {
   var client = getSupabaseClient();
@@ -834,13 +876,28 @@ async function saveSetlistToSupabase(setlist) {
   var res = await client.from("setlists").upsert(row, { onConflict: "id" });
   if (res.error) throw new Error(res.error.message);
 }
-async function saveSetlistSetsToSupabase(id, sets) {
+async function saveSetlistSetsToSupabase(id, sets, base) {
   var client = getSupabaseClient();
-  var res = await client.from("setlists").update({
-    sets,
-    updated_at: (/* @__PURE__ */ new Date()).toISOString()
-  }).eq("id", id);
-  if (res.error) throw new Error(res.error.message);
+  if (!base) {
+    var plain = await client.from("setlists").update({
+      sets,
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    }).eq("id", id);
+    if (plain.error) throw new Error(plain.error.message);
+    return sets;
+  }
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var cur = await client.from("setlists").select("sets,updated_at").eq("id", id).maybeSingle();
+    if (cur.error) throw new Error(cur.error.message);
+    if (!cur.data) return sets;
+    var next = mergeSetlistSets(base, sets, cur.data.sets || []);
+    var q = client.from("setlists").update({ sets: next, updated_at: (/* @__PURE__ */ new Date()).toISOString() }).eq("id", id);
+    if (cur.data.updated_at) q = q.eq("updated_at", cur.data.updated_at);
+    var res = await q.select("id");
+    if (res.error) throw new Error(res.error.message);
+    if (res.data && res.data.length) return next;
+  }
+  throw new Error("Setlist kept changing during save \u2014 will retry");
 }
 async function deleteSetlistFromSupabase(id) {
   var client = getSupabaseClient();
@@ -980,9 +1037,10 @@ function loadPersonalPrefs() {
   let lastSeenDefaultId = null;
   let arrColPct = 50;
   try {
-    activeViewId = localStorage.getItem(PREF_VIEW_KEY) || null;
-    activeSetlistId = localStorage.getItem(PREF_SETLIST_KEY) || null;
-    lastSeenDefaultId = localStorage.getItem(PREF_LAST_SEEN_DEFAULT_KEY) || null;
+    activeViewId = localStorage.getItem(PREF_VIEW_KEY) || localStorage.getItem(LEGACY_PREF_VIEW_KEY) || null;
+    activeSetlistId = localStorage.getItem(PREF_SETLIST_KEY) || localStorage.getItem(LEGACY_PREF_SETLIST_KEY) || null;
+    const seenNs = localStorage.getItem(PREF_LAST_SEEN_DEFAULT_KEY);
+    lastSeenDefaultId = (seenNs != null ? seenNs : localStorage.getItem(LEGACY_PREF_LAST_SEEN_DEFAULT_KEY)) || null;
     const savedPct = localStorage.getItem(PREF_ARR_COL_KEY);
     if (savedPct != null) {
       const n = parseFloat(savedPct);
@@ -1042,9 +1100,9 @@ async function loadAllData() {
     throw err;
   }
 }
-function saveOneSongRemote(patch, viewerName) {
+function saveOneSongRemote(patch, viewerName, opts) {
   return supabaseCall("saveSongPatch", function() {
-    return saveSongPatchToSupabase(patch, viewerName);
+    return saveSongPatchToSupabase(patch, viewerName, opts);
   });
 }
 function deleteOneSongRemote(id) {
@@ -1062,9 +1120,9 @@ function saveSetlistRemote(setlist) {
     return saveSetlistToSupabase(setlist);
   });
 }
-function saveSetlistSetsRemote(id, sets) {
+function saveSetlistSetsRemote(id, sets, base) {
   return supabaseCall("saveSetlistSets", function() {
-    return saveSetlistSetsToSupabase(id, sets);
+    return saveSetlistSetsToSupabase(id, sets, base);
   });
 }
 function deleteSetlistRemote(id) {
@@ -1087,8 +1145,11 @@ function saveViewsRemote(views) {
     return saveViewsToSupabase(views);
   });
 }
-function scanDriveLinksRemote() {
-  return gsCall("scanDriveLinks", void 0, 12e4);
+function scanDriveLinksRemote(songs) {
+  const slim = (songs || []).map(function(s) {
+    return { id: s.id, title: s.title, recording: s.recording || [] };
+  });
+  return gsCall("scanDriveLinks", { songs: slim }, 12e4);
 }
 function getDriveFolderSettingsRemote() {
   return gsCall("getDriveFolderSettings");
@@ -1120,6 +1181,256 @@ function driveFileIdFromUrl(url) {
   const m = s.match(/\/file\/d\/([-\w]{20,})/) || s.match(/[?&]id=([-\w]{20,})/) || s.match(/^([-\w]{20,})$/);
   return m ? m[1] : "";
 }
+const SONG_LIST_FIELDS = ["recording", "links", "arrangementRows", "alexTodos", "nickTodos", "calebTodos", "danTodos"];
+function listItemKey(item) {
+  if (item && typeof item === "object") {
+    return item.id != null && item.id !== "" ? "id:" + item.id : "v:" + stableStringify(item);
+  }
+  return "v:" + String(item);
+}
+function mergeListThreeWay(base, mine, theirs) {
+  base = Array.isArray(base) ? base : [];
+  mine = Array.isArray(mine) ? mine : [];
+  theirs = Array.isArray(theirs) ? theirs : [];
+  function mapOf(list) {
+    const m = /* @__PURE__ */ new Map();
+    list.forEach(function(x) {
+      const k = listItemKey(x);
+      if (!m.has(k)) m.set(k, x);
+    });
+    return m;
+  }
+  const B = mapOf(base), M = mapOf(mine), T = mapOf(theirs);
+  const same = function(a, b) {
+    return stableStringify(a) === stableStringify(b);
+  };
+  const out = [];
+  const used = /* @__PURE__ */ new Set();
+  mine.forEach(function(x) {
+    const k = listItemKey(x);
+    if (used.has(k)) return;
+    if (B.has(k) && !T.has(k) && same(x, B.get(k))) return;
+    let v = x;
+    if (B.has(k) && T.has(k) && same(x, B.get(k))) v = T.get(k);
+    out.push(v);
+    used.add(k);
+  });
+  theirs.forEach(function(x, i) {
+    const k = listItemKey(x);
+    if (used.has(k)) return;
+    if (B.has(k) && !M.has(k) && same(x, B.get(k))) return;
+    const indexIn = function(item) {
+      const key = listItemKey(item);
+      return out.findIndex(function(o) {
+        return listItemKey(o) === key;
+      });
+    };
+    let hasLater = false;
+    for (let j = i + 1; j < theirs.length; j++) {
+      if (indexIn(theirs[j]) !== -1) {
+        hasLater = true;
+        break;
+      }
+    }
+    let pos = hasLater ? 0 : out.length;
+    if (hasLater) {
+      for (let j = i - 1; j >= 0; j--) {
+        const idx = indexIn(theirs[j]);
+        if (idx !== -1) {
+          pos = idx + 1;
+          break;
+        }
+      }
+      while (pos < out.length && !B.has(listItemKey(out[pos])) && !T.has(listItemKey(out[pos]))) pos++;
+    }
+    out.splice(pos, 0, x);
+    used.add(k);
+  });
+  return out;
+}
+function sameList(a, b) {
+  return stableStringify(a || []) === stableStringify(b || []);
+}
+function mergeSetlistSets(base, mine, theirs) {
+  function byName(sets) {
+    const m = {};
+    (sets || []).forEach(function(s) {
+      if (s && s.name != null && !m[s.name]) m[s.name] = s.songIds || [];
+    });
+    return m;
+  }
+  const B = byName(base), T = byName(theirs);
+  const mineSetOf = {};
+  (mine || []).forEach(function(s) {
+    (s.songIds || []).forEach(function(id) {
+      if (!mineSetOf[id]) mineSetOf[id] = s.name;
+    });
+  });
+  const seen = /* @__PURE__ */ new Set();
+  return (mine || []).map(function(s) {
+    const b = B[s.name] || [];
+    const t = T[s.name] || b;
+    const ids = mergeListThreeWay(b, s.songIds || [], t).filter(function(id) {
+      if (mineSetOf[id] && mineSetOf[id] !== s.name) return false;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    return Object.assign({}, s, { songIds: ids });
+  });
+}
+let _reloadHolds = 0;
+let _pendingReload = null;
+function holdAutoReload() {
+  _reloadHolds++;
+  let released = false;
+  return function release() {
+    if (released) return;
+    released = true;
+    _reloadHolds--;
+    if (_reloadHolds === 0 && _pendingReload) {
+      const run = _pendingReload;
+      _pendingReload = null;
+      run();
+    }
+  };
+}
+function runWhenReloadAllowed(fn) {
+  if (_reloadHolds > 0) _pendingReload = fn;
+  else fn();
+}
+function addRecordingLinkOnce(recs, link) {
+  const list = Array.isArray(recs) ? recs : [];
+  const fid = driveFileIdFromUrl(link && link.url);
+  if (fid && list.some(function(l) {
+    return driveFileIdFromUrl(l && l.url) === fid;
+  })) return list;
+  return list.concat([link]);
+}
+function mergeDriveScanIntoRecordings(recs, toAdd, staleFileIds) {
+  const list = Array.isArray(recs) ? recs : [];
+  const stale = new Set(staleFileIds || []);
+  let next = list.filter(function(l) {
+    const fid = driveFileIdFromUrl(l && l.url);
+    return !fid || !stale.has(fid);
+  });
+  (toAdd || []).forEach(function(l) {
+    next = addRecordingLinkOnce(next, l);
+  });
+  const same = next.length === list.length && next.every(function(l, i) {
+    return l === list[i];
+  });
+  return same ? list : next;
+}
+const UPLOAD_STORE = "pending";
+let _uploadDbPromise = null;
+function openUploadDb() {
+  if (_uploadDbPromise) return _uploadDbPromise;
+  _uploadDbPromise = new Promise(function(resolve, reject) {
+    if (typeof indexedDB === "undefined") {
+      reject(new Error("IndexedDB unavailable"));
+      return;
+    }
+    const channel = typeof window !== "undefined" && window.__SUPABASE_CHANNEL__ || "default";
+    const req = indexedDB.open("bandSetlist_uploads_" + channel, 1);
+    req.onupgradeneeded = function() {
+      req.result.createObjectStore(UPLOAD_STORE, { keyPath: "uploadId" });
+    };
+    req.onsuccess = function() {
+      const db = req.result;
+      db.onclose = function() {
+        _uploadDbPromise = null;
+      };
+      db.onversionchange = function() {
+        db.close();
+        _uploadDbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = function() {
+      reject(req.error || new Error("IndexedDB open failed"));
+    };
+  });
+  _uploadDbPromise.catch(function() {
+    _uploadDbPromise = null;
+  });
+  return _uploadDbPromise;
+}
+function uploadDbTx(mode, fn) {
+  return openUploadDb().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      let tx;
+      try {
+        tx = db.transaction(UPLOAD_STORE, mode);
+      } catch (e) {
+        _uploadDbPromise = null;
+        reject(e);
+        return;
+      }
+      let out;
+      const r = fn(tx.objectStore(UPLOAD_STORE));
+      if (r) r.onsuccess = function() {
+        out = r.result;
+      };
+      tx.oncomplete = function() {
+        resolve(out);
+      };
+      tx.onerror = function() {
+        reject(tx.error || new Error("IndexedDB write failed"));
+      };
+      tx.onabort = function() {
+        reject(tx.error || new Error("IndexedDB write aborted"));
+      };
+    });
+  });
+}
+function savePendingUpload(rec) {
+  return uploadDbTx("readwrite", function(s) {
+    return s.put(rec);
+  });
+}
+function getPendingUpload(id) {
+  return uploadDbTx("readonly", function(s) {
+    return s.get(id);
+  });
+}
+function deletePendingUpload(id) {
+  return uploadDbTx("readwrite", function(s) {
+    return s.delete(id);
+  });
+}
+function listPendingUploads() {
+  return uploadDbTx("readonly", function(s) {
+    return s.getAll();
+  });
+}
+function updatePendingUpload(id, patch) {
+  return uploadDbTx("readwrite", function(s) {
+    const g = s.get(id);
+    g.onsuccess = function() {
+      if (g.result) s.put(Object.assign(g.result, patch));
+    };
+    return null;
+  });
+}
+const PERMANENT_UPLOAD_REASONS = { "too-big": 1, "no-folder": 1, "folder-open-failed": 1, "needs-drive-auth": 1, "no-data": 1, "no-song": 1 };
+function uploadRetryDelay(attempt) {
+  const n = Math.max(0, (attempt || 1) - 1);
+  return Math.min(5e3 * Math.pow(2, n), 5 * 60 * 1e3) + Math.floor(Math.random() * 2e3);
+}
+async function fetchSongRecordingFileIds(songId) {
+  const client = getSupabaseClient();
+  if (!client) throw new Error("Supabase client not available");
+  const res = await supabaseCall("uploadVerify", function() {
+    return client.from("songs").select("recording").eq("id", songId).maybeSingle();
+  });
+  if (res.error) throw new Error(res.error.message || "Couldn't check the song");
+  if (!res.data) return null;
+  const recs = Array.isArray(res.data.recording) ? res.data.recording : [];
+  return new Set(recs.map(function(l) {
+    return driveFileIdFromUrl(l && l.url);
+  }).filter(Boolean));
+}
 function deleteFileReasonText(reason) {
   switch (reason) {
     case "needs-drive-auth":
@@ -1133,39 +1444,90 @@ function deleteFileReasonText(reason) {
   }
 }
 const UploadContext = React.createContext(null);
-function UploadToast({ upload, onRetry, onDismiss }) {
-  const [elapsed, setElapsed] = useState(0);
+function UploadToast({ uploads, onRetry, onRetryNow, onDiscard, onSaveCopy }) {
+  const [now, setNow] = useState(Date.now());
+  const [armDiscard, setArmDiscard] = useState(null);
+  const list = uploads || [];
+  const active = list.filter(function(u) {
+    return u.phase !== "done";
+  });
+  const focus = list.find(function(u) {
+    return u.phase === "uploading" || u.phase === "linking";
+  }) || list.find(function(u) {
+    return u.phase === "error";
+  }) || list.find(function(u) {
+    return u.phase === "waiting" || u.phase === "queued";
+  }) || list.find(function(u) {
+    return u.phase === "done";
+  });
+  const ticking = !!(focus && (focus.phase === "uploading" || focus.phase === "linking" || focus.phase === "waiting"));
   useEffect(() => {
-    if (!upload || upload.phase !== "uploading") return;
-    setElapsed(Math.floor((Date.now() - upload.startedAt) / 1e3));
-    const id = setInterval(() => {
-      setElapsed(Math.floor((Date.now() - upload.startedAt) / 1e3));
+    if (!ticking) return;
+    setNow(Date.now());
+    const id = setInterval(function() {
+      setNow(Date.now());
     }, 1e3);
     return () => clearInterval(id);
-  }, [upload && upload.phase, upload && upload.startedAt]);
-  if (!upload) return null;
-  const isUploading = upload.phase === "uploading";
-  const isDone = upload.phase === "done";
-  const isError = upload.phase === "error";
+  }, [ticking, focus && focus.uploadId]);
+  useEffect(() => {
+    setArmDiscard(null);
+  }, [focus && focus.uploadId, focus && focus.phase]);
+  if (!focus) return null;
+  const isRunning = focus.phase === "uploading" || focus.phase === "linking";
+  const isDone = focus.phase === "done";
+  const isError = focus.phase === "error";
+  const isWaiting = focus.phase === "waiting" || focus.phase === "queued";
+  const others = active.filter(function(u) {
+    return u.uploadId !== focus.uploadId;
+  }).length;
+  let title, detail;
+  if (isDone) {
+    title = focus.songGone ? "Uploaded to Drive" : "Uploaded!";
+    detail = focus.songGone ? focus.songTitle + " was deleted \u2014 the file is in the Drive folder." : focus.songTitle;
+  } else if (isRunning) {
+    title = focus.phase === "linking" ? "Adding to song\u2026" : "Uploading\u2026";
+    detail = focus.songTitle + " \xB7 " + humanSize(focus.size || 0) + " \xB7 " + Math.max(0, Math.floor((now - (focus.startedAt || now)) / 1e3)) + "s";
+  } else if (isError) {
+    title = "Upload needs you";
+    detail = focus.songTitle + " \u2014 " + (focus.errMsg || "Upload failed.");
+  } else {
+    const secs = Math.max(0, Math.ceil(((focus.retryAt || 0) - now) / 1e3));
+    title = focus.phase === "queued" ? "Waiting to upload" : "Will retry upload" + (secs ? " in " + secs + "s" : "\u2026");
+    detail = focus.songTitle + (focus.errMsg ? " \u2014 " + focus.errMsg : "") + (focus.stored ? " Saved on this phone." : " Keep the app open.");
+  }
+  if (others > 0 && !isDone) detail += " \xB7 " + others + " more waiting";
   const toastStyle = {
     position: "fixed",
     bottom: 16,
     left: 12,
     right: 12,
     zIndex: 9999,
-    background: isError ? "var(--surface-raised)" : isDone ? "rgba(60,140,80,0.95)" : "var(--surface-raised)",
+    background: isDone ? "rgba(60,140,80,0.95)" : "var(--surface-raised)",
     border: isError ? "1px solid var(--needs)" : isDone ? "1px solid rgba(60,140,80,0.5)" : "1px solid var(--gold)",
     borderRadius: 12,
     padding: "12px 14px",
     boxShadow: "0 4px 20px rgba(0,0,0,0.25)",
     fontFamily: "var(--display)",
     color: "var(--text)",
-    animation: isUploading ? "uploadPulse 2s ease-in-out infinite" : "none"
+    animation: isRunning ? "uploadPulse 2s ease-in-out infinite" : "none"
   };
-  return /* @__PURE__ */ React.createElement(React.Fragment, null, isUploading && /* @__PURE__ */ React.createElement("style", null, `@keyframes uploadPulse {
+  const btn = { background: "none", border: "1px solid var(--line)", color: "var(--dim)", borderRadius: 6, padding: "6px 10px", fontSize: 12, cursor: "pointer" };
+  const btnGold = { ...btn, background: "var(--gold)", border: "none", color: "var(--bg)", fontWeight: 600 };
+  const armed = armDiscard === focus.uploadId;
+  return /* @__PURE__ */ React.createElement(React.Fragment, null, isRunning && /* @__PURE__ */ React.createElement("style", null, `@keyframes uploadPulse {
           0%, 100% { opacity: 1; }
           50% { opacity: 0.85; }
-        }`), /* @__PURE__ */ React.createElement("div", { style: toastStyle }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, isUploading && /* @__PURE__ */ React.createElement(Icon, { name: "loader", className: "spin", size: 16, color: "var(--gold)" }), isDone && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 16 } }, "\u2713"), isError && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 16, color: "var(--needs)" } }, "\u2715"), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isDone ? "#fff" : "var(--text)" } }, isDone ? "Uploaded!" : isError ? "Upload failed" : "Uploading\u2026"), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: isDone ? "rgba(255,255,255,0.8)" : "var(--dim)", marginTop: 2 } }, upload.songTitle, isUploading && /* @__PURE__ */ React.createElement(React.Fragment, null, " \xB7 ", humanSize(upload.fileSize), " \xB7 ", elapsed, "s"), isError && upload.errMsg && /* @__PURE__ */ React.createElement(React.Fragment, null, " \u2014 ", upload.errMsg))), isError && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6 } }, /* @__PURE__ */ React.createElement("button", { onClick: onRetry, style: { background: "var(--gold)", border: "none", color: "var(--bg)", fontWeight: 600, borderRadius: 6, padding: "6px 10px", fontSize: 12, cursor: "pointer" } }, "Retry"), /* @__PURE__ */ React.createElement("button", { onClick: onDismiss, style: { background: "none", border: "1px solid var(--line)", color: "var(--dim)", borderRadius: 6, padding: "6px 10px", fontSize: 12, cursor: "pointer" } }, "Dismiss")))));
+        }`), /* @__PURE__ */ React.createElement("div", { style: toastStyle }, /* @__PURE__ */ React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10 } }, isRunning && /* @__PURE__ */ React.createElement(Icon, { name: "loader", className: "spin", size: 16, color: "var(--gold)" }), isDone && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 16 } }, "\u2713"), isError && /* @__PURE__ */ React.createElement("span", { style: { fontSize: 16, color: "var(--needs)" } }, "!"), isWaiting && /* @__PURE__ */ React.createElement(Icon, { name: "loader", size: 16, color: "var(--dim)" }), /* @__PURE__ */ React.createElement("div", { style: { flex: 1, minWidth: 0 } }, /* @__PURE__ */ React.createElement("div", { style: { fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: isDone ? "#fff" : "var(--text)" } }, title), /* @__PURE__ */ React.createElement("div", { style: { fontSize: 11.5, color: isDone ? "rgba(255,255,255,0.8)" : "var(--dim)", marginTop: 2 } }, detail)), isWaiting && focus.phase === "waiting" && /* @__PURE__ */ React.createElement("button", { onClick: onRetryNow, style: btnGold }, "Retry now")), isError && /* @__PURE__ */ React.createElement("div", { style: { display: "flex", gap: 6, marginTop: 10, justifyContent: "flex-end" } }, /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        if (armed) onDiscard(focus.uploadId);
+        else setArmDiscard(focus.uploadId);
+      },
+      style: armed ? { ...btn, color: "var(--needs)", borderColor: "var(--needs)" } : btn
+    },
+    armed ? "Tap again \u2014 discard" : "Discard"
+  ), /* @__PURE__ */ React.createElement("button", { onClick: () => onSaveCopy(focus.uploadId), style: btn }, "Save copy"), /* @__PURE__ */ React.createElement("button", { onClick: () => onRetry(focus.uploadId), style: btnGold }, "Retry"))));
 }
 function App() {
   const [songs, setSongs] = useState(null);
@@ -1212,59 +1574,285 @@ function App() {
   const [openId, setOpenId] = useState(null);
   const [pendingRestore, setPendingRestore] = useState(null);
   const songUiStateRef = useRef({ collapsed: null, scrollTop: 0 });
-  const [bgUpload, setBgUpload] = useState(null);
+  const [uploads, setUploads] = useState([]);
+  const uploadsRef = useRef([]);
+  const uploadBlobsRef = useRef({});
+  const uploadPumpingRef = useRef(false);
+  const uploadTimerRef = useRef(null);
+  const pumpUploadsRef = useRef(null);
   const songsRef = useRef(songs);
   songsRef.current = songs;
-  const bgPayloadRef = useRef(null);
-  const bgFileRef = useRef(null);
-  function runBgUpload(songId, songTitle, fileOrBlob, payload) {
-    const fileSize = fileOrBlob.size;
-    setBgUpload({ songId, songTitle, fileSize, startedAt: Date.now(), phase: "uploading", errMsg: "" });
-    bgPayloadRef.current = payload;
-    bgFileRef.current = fileOrBlob;
-    (async function() {
+  function setUploadList(next) {
+    uploadsRef.current = next;
+    setUploads(next);
+  }
+  function patchUpload(id, patch) {
+    setUploadList(uploadsRef.current.map(function(u) {
+      return u.uploadId === id ? Object.assign({}, u, patch) : u;
+    }));
+  }
+  function findUpload(id) {
+    return uploadsRef.current.find(function(u) {
+      return u.uploadId === id;
+    });
+  }
+  function kickUploads() {
+    setTimeout(function() {
+      if (pumpUploadsRef.current) pumpUploadsRef.current();
+    }, 0);
+  }
+  async function startBackgroundUpload(songId, songTitle, fileOrBlob, meta) {
+    const item = {
+      uploadId: "up" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+      songId,
+      songTitle,
+      filename: meta.filename || "",
+      mimeType: meta.mimeType || fileOrBlob.type || "audio/mp4",
+      name: meta.name || "Recording",
+      size: fileOrBlob.size,
+      createdAt: Date.now()
+    };
+    let stored = false;
+    try {
+      const bytes = await fileOrBlob.arrayBuffer();
+      await savePendingUpload(Object.assign({}, item, { bytes }));
+      stored = true;
       try {
-        var dataB64 = await fileToBase64(fileOrBlob);
-        var res = await uploadRecordingRemote(Object.assign({}, payload, { dataB64 }));
-        if (!res || !res.ok) {
-          setBgUpload(function(prev) {
-            return prev ? Object.assign({}, prev, { phase: "error", errMsg: uploadReasonText(res && res.reason) }) : null;
-          });
-          return;
-        }
-        var cur = songsRef.current;
-        var song = cur && cur.find(function(s) {
-          return s.id === songId;
-        });
-        var recs = song && song.recording || [];
-        updateSong(songId, { recording: [].concat(recs, [res.link]) });
-        setBgUpload(function(prev) {
-          return prev ? Object.assign({}, prev, { phase: "done" }) : null;
-        });
-        setTimeout(function() {
-          setBgUpload(null);
-        }, 2500);
-      } catch (err) {
-        setBgUpload(function(prev) {
-          return prev ? Object.assign({}, prev, { phase: "error", errMsg: err && err.message || "Upload failed" }) : null;
-        });
+        if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      } catch (e) {
       }
-    })();
-  }
-  function retryBgUpload() {
-    var prev = bgUpload;
-    if (!prev || !bgPayloadRef.current || !bgFileRef.current) return;
-    runBgUpload(prev.songId, prev.songTitle, bgFileRef.current, bgPayloadRef.current);
-  }
-  function dismissBgUpload() {
-    setBgUpload(null);
-  }
-  function startBackgroundUpload(songId, songTitle, fileOrBlob, payload) {
-    if (bgUpload && bgUpload.phase === "uploading") return false;
-    runBgUpload(songId, songTitle, fileOrBlob, payload);
+    } catch (e) {
+      console.warn("Couldn't keep a copy of the recording on this device:", e);
+    }
+    uploadBlobsRef.current[item.uploadId] = fileOrBlob;
+    setUploadList(uploadsRef.current.concat([Object.assign({}, item, { phase: "queued", stored, attempts: 0 })]));
+    kickUploads();
     return true;
   }
-  const uploadCtxValue = { startUpload: startBackgroundUpload, busy: !!(bgUpload && bgUpload.phase === "uploading") };
+  async function getUploadBlob(u) {
+    if (uploadBlobsRef.current[u.uploadId]) return uploadBlobsRef.current[u.uploadId];
+    const rec = await getPendingUpload(u.uploadId);
+    if (!rec || !rec.bytes) return null;
+    const blob = new Blob([rec.bytes], { type: rec.mimeType || "audio/mp4" });
+    uploadBlobsRef.current[u.uploadId] = blob;
+    return blob;
+  }
+  function uploadFailed(id, msg) {
+    const u = findUpload(id);
+    const attempts = (u && u.attempts || 0) + 1;
+    patchUpload(id, { phase: "waiting", attempts, errMsg: msg, retryAt: Date.now() + uploadRetryDelay(attempts) });
+  }
+  async function attachAndConfirmLink(songId, result) {
+    const fid = result.fileId || driveFileIdFromUrl(result.link && result.link.url);
+    for (let i = 0; i < 6; i++) {
+      const song = (songsRef.current || []).find(function(s) {
+        return s.id === songId;
+      });
+      if (song) {
+        const recs = song.recording || [];
+        const next = addRecordingLinkOnce(recs, result.link);
+        if (next !== recs) {
+          updateSong(songId, { recording: next });
+          flushSongSave(songId);
+        }
+      }
+      await new Promise(function(r) {
+        setTimeout(r, i === 0 ? 1500 : 2500);
+      });
+      const remote = await fetchSongRecordingFileIds(songId);
+      if (remote === null) {
+        if (!song) return "no-song";
+        continue;
+      }
+      if (remote.has(fid)) return "saved";
+    }
+    return "pending";
+  }
+  async function runOneUpload(item) {
+    const id = item.uploadId;
+    patchUpload(id, { phase: "uploading", startedAt: Date.now() });
+    try {
+      let result = item.result;
+      if (!result) {
+        const blob = await getUploadBlob(item);
+        if (!blob) {
+          patchUpload(id, { phase: "error", errMsg: "This recording's audio is missing from the phone." });
+          return;
+        }
+        const song = (songsRef.current || []).find(function(s) {
+          return s.id === item.songId;
+        });
+        const dataB64 = await fileToBase64(blob);
+        const res = await uploadRecordingRemote({
+          songId: item.songId,
+          songTitle: song && song.title || item.songTitle,
+          uploadId: id,
+          filename: item.filename,
+          mimeType: item.mimeType,
+          name: item.name,
+          dataB64
+        });
+        if (!res || !res.ok) {
+          const reason = res && res.reason;
+          if (PERMANENT_UPLOAD_REASONS[reason]) patchUpload(id, { phase: "error", errMsg: uploadReasonText(reason) });
+          else uploadFailed(id, uploadReasonText(reason));
+          return;
+        }
+        result = { fileId: res.fileId, link: res.link };
+        patchUpload(id, { result });
+        try {
+          await updatePendingUpload(id, { result });
+        } catch (e) {
+        }
+      }
+      patchUpload(id, { phase: "linking" });
+      const verdict = await attachAndConfirmLink(item.songId, result);
+      if (verdict === "pending") {
+        uploadFailed(id, "It's in Drive \u2014 still adding it to the song.");
+        return;
+      }
+      try {
+        await deletePendingUpload(id);
+      } catch (e) {
+      }
+      delete uploadBlobsRef.current[id];
+      patchUpload(id, { phase: "done", songGone: verdict === "no-song" });
+      setTimeout(function() {
+        setUploadList(uploadsRef.current.filter(function(u) {
+          return u.uploadId !== id;
+        }));
+      }, verdict === "no-song" ? 6e3 : 2500);
+    } catch (err) {
+      const offline = typeof navigator !== "undefined" && navigator.onLine === false;
+      uploadFailed(id, offline ? "No connection." : "Upload didn't go through.");
+      console.warn("Upload attempt failed:", err);
+    }
+  }
+  async function pumpUploads() {
+    if (uploadPumpingRef.current || !songsRef.current) return;
+    clearTimeout(uploadTimerRef.current);
+    const now = Date.now();
+    const next = uploadsRef.current.find(function(u) {
+      return u.phase === "queued" || u.phase === "waiting" && (u.retryAt || 0) <= now;
+    });
+    if (!next) {
+      const waits = uploadsRef.current.filter(function(u) {
+        return u.phase === "waiting";
+      }).map(function(u) {
+        return u.retryAt || 0;
+      });
+      if (waits.length) {
+        uploadTimerRef.current = setTimeout(kickUploads, Math.max(500, Math.min.apply(null, waits) - now));
+      }
+      return;
+    }
+    uploadPumpingRef.current = true;
+    try {
+      await runOneUpload(next);
+    } finally {
+      uploadPumpingRef.current = false;
+    }
+    kickUploads();
+  }
+  pumpUploadsRef.current = pumpUploads;
+  function retryUploadsNow() {
+    setUploadList(uploadsRef.current.map(function(u) {
+      return u.phase === "waiting" ? Object.assign({}, u, { retryAt: 0 }) : u;
+    }));
+    kickUploads();
+  }
+  function retryUpload(id) {
+    patchUpload(id, { phase: "queued", retryAt: 0 });
+    kickUploads();
+  }
+  async function discardUpload(id) {
+    try {
+      await deletePendingUpload(id);
+    } catch (e) {
+    }
+    delete uploadBlobsRef.current[id];
+    setUploadList(uploadsRef.current.filter(function(u) {
+      return u.uploadId !== id;
+    }));
+  }
+  async function saveUploadCopy(id) {
+    const u = findUpload(id);
+    if (!u) return;
+    const blob = await getUploadBlob(u);
+    if (!blob) return;
+    const m = String(u.filename || "").match(/\.([A-Za-z0-9]{1,5})$/);
+    const ext = m ? m[1] : recMimeToExt(u.mimeType);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = ((u.songTitle || "Recording") + " " + (u.name || "")).trim() + "." + ext;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function() {
+      URL.revokeObjectURL(url);
+    }, 6e4);
+  }
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    listPendingUploads().then(function(recs) {
+      if (cancelled || !recs || !recs.length) return;
+      const known = new Set(uploadsRef.current.map(function(u) {
+        return u.uploadId;
+      }));
+      const add = recs.filter(function(r) {
+        return r && r.uploadId && !known.has(r.uploadId);
+      }).sort(function(a, b) {
+        return (a.createdAt || 0) - (b.createdAt || 0);
+      }).map(function(r) {
+        return {
+          uploadId: r.uploadId,
+          songId: r.songId,
+          songTitle: r.songTitle,
+          filename: r.filename,
+          mimeType: r.mimeType,
+          name: r.name,
+          size: r.size,
+          createdAt: r.createdAt,
+          result: r.result || null,
+          phase: "queued",
+          stored: true,
+          attempts: 0
+        };
+      });
+      if (add.length) setUploadList(uploadsRef.current.concat(add));
+      kickUploads();
+    }).catch(function(e) {
+      console.warn("Couldn't read saved uploads:", e);
+    });
+    function onOnline() {
+      retryUploadsNow();
+    }
+    function onVisible() {
+      if (document.visibilityState === "visible") retryUploadsNow();
+    }
+    window.addEventListener("online", onOnline);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("online", onOnline);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loaded]);
+  function removeDriveFileEverywhere(fileId) {
+    if (!fileId) return;
+    (songsRef.current || []).forEach((s) => {
+      ["recording", "links"].forEach((f) => {
+        const list = Array.isArray(s[f]) ? s[f] : [];
+        const next = list.filter((l) => driveFileIdFromUrl(l && l.url) !== fileId);
+        if (next.length !== list.length) updateSong(s.id, { [f]: next });
+      });
+    });
+  }
+  const uploadCtxValue = { startUpload: startBackgroundUpload, removeDriveFileEverywhere };
+  const saveReloadSnapshotRef = useRef(null);
+  saveReloadSnapshotRef.current = saveReloadSnapshot;
   function saveReloadSnapshot() {
     try {
       const snapshot = {
@@ -1388,14 +1976,34 @@ function App() {
     songSaveTimers.current[id] = { ...entry, inFlight: true, inFlightSince: Date.now() };
     setSaveState("saving");
     var viewerName = views && views[activeViewId] ? views[activeViewId].name : null;
-    saveOneSongRemote(patchBeingSaved, viewerName).then(() => {
+    saveOneSongRemote(patchBeingSaved, viewerName, { bases: entry.bases || {}, isNew: !!entry.isNew }).then((result) => {
       reportSaveSuccess();
       const current = songSaveTimers.current[id];
       if (!current) return;
+      if (result && result.deleted) {
+        if (current.debounce) clearTimeout(current.debounce);
+        if (current.retry) clearTimeout(current.retry);
+        delete songSaveTimers.current[id];
+        persistPendingEdits();
+        setSongs((prev) => prev.filter((s) => s.id !== id));
+        setOpenId((o) => o === id ? null : o);
+        return;
+      }
+      const merged = result && result.merged || {};
+      const nextBases = { ...current.bases || {} };
+      SONG_LIST_FIELDS.forEach((f) => {
+        if (Object.prototype.hasOwnProperty.call(patchBeingSaved, f)) nextBases[f] = patchBeingSaved[f];
+      });
+      const show = {};
+      Object.keys(merged).forEach((f) => {
+        const newer = current.pendingPatch && current.pendingPatch !== patchBeingSaved && current.pendingPatch[f] !== patchBeingSaved[f];
+        if (!newer) show[f] = merged[f];
+      });
+      if (Object.keys(show).length) setSongs((prev) => prev.map((s) => s.id === id ? { ...s, ...show } : s));
       if (current.pendingPatch === patchBeingSaved) {
-        songSaveTimers.current[id] = { ...current, pendingPatch: null, retry: null, retryCount: 0, inFlight: false };
+        songSaveTimers.current[id] = { ...current, pendingPatch: null, bases: {}, isNew: false, retry: null, retryCount: 0, inFlight: false };
       } else {
-        songSaveTimers.current[id] = { ...current, retryCount: 0, inFlight: false };
+        songSaveTimers.current[id] = { ...current, bases: nextBases, isNew: false, retryCount: 0, inFlight: false };
         attemptSongSaveFor(id);
       }
       persistPendingEdits();
@@ -1414,30 +2022,142 @@ function App() {
       persistPendingEdits();
     });
   }
+  const unrecoveredEditsRef = useRef(null);
   function persistPendingEdits() {
     try {
+      const held = unrecoveredEditsRef.current;
       const patches = {};
+      const bases = {};
+      const newIds = [];
+      if (held) {
+        for (const id in held.patches) patches[id] = held.patches[id];
+        for (const id in held.bases) bases[id] = held.bases[id];
+        held.newIds.forEach((id) => {
+          if (held.patches[id]) newIds.push(id);
+        });
+      }
       for (const id in songSaveTimers.current) {
         const t = songSaveTimers.current[id];
-        if (t && t.pendingPatch) patches[id] = t.pendingPatch;
+        if (!t || !t.pendingPatch) continue;
+        patches[id] = { ...patches[id] || {}, ...t.pendingPatch };
+        if (t.bases && Object.keys(t.bases).length) bases[id] = { ...t.bases || {}, ...bases[id] || {} };
+        if (t.isNew && newIds.indexOf(id) === -1) newIds.push(id);
       }
       if (Object.keys(patches).length) {
-        localStorage.setItem(PENDING_EDITS_KEY, JSON.stringify({ savedAt: Date.now(), patches }));
+        localStorage.setItem(PENDING_EDITS_KEY, JSON.stringify({ savedAt: Date.now(), patches, bases, newIds }));
       } else {
         localStorage.removeItem(PENDING_EDITS_KEY);
       }
     } catch (e) {
     }
   }
-  function scheduleSongSave(id, patch) {
+  function readHeldEdits() {
+    let patches = null;
+    let extras = { bases: {}, newIds: [] };
+    let legacyClaimed = false;
+    try {
+      const raw = localStorage.getItem(PENDING_EDITS_KEY);
+      if (raw) {
+        patches = readRecoverablePatches(raw, Date.now());
+        if (patches) extras = readRecoverableExtras(raw, Date.now());
+        else localStorage.removeItem(PENDING_EDITS_KEY);
+      }
+    } catch (e) {
+    }
+    try {
+      const channel = storageChannel();
+      const legacyRaw = localStorage.getItem(LEGACY_PENDING_EDITS_KEY);
+      if (legacyRaw && shouldClearLegacyPendingEdits(channel)) {
+        const legacy = claimLegacyPendingEdits(legacyRaw, Date.now(), channel);
+        if (legacy) {
+          const merged = { ...legacy };
+          if (patches) {
+            for (const id in patches) merged[id] = { ...merged[id] || {}, ...patches[id] };
+          }
+          patches = merged;
+        }
+        legacyClaimed = true;
+      }
+    } catch (e) {
+    }
+    if (!patches && !legacyClaimed) return null;
+    return { patches: patches || {}, bases: extras.bases, newIds: extras.newIds, legacyClaimed };
+  }
+  function songsWithLocalEdits(serverSongs) {
+    const held = unrecoveredEditsRef.current;
+    const ids = new Set(serverSongs.map((s) => s.id));
+    const out = serverSongs.map((s) => {
+      let m = s;
+      if (held && held.patches[s.id]) m = { ...m, ...held.patches[s.id] };
+      const t = songSaveTimers.current[s.id];
+      if (t && t.pendingPatch) m = { ...m, ...t.pendingPatch };
+      return m;
+    });
+    const unsavedNew = {};
+    if (held) held.newIds.forEach((id) => {
+      if (held.patches[id]) unsavedNew[id] = { ...held.patches[id] };
+    });
+    for (const id in songSaveTimers.current) {
+      const t = songSaveTimers.current[id];
+      if (t && t.isNew && t.pendingPatch) unsavedNew[id] = { ...unsavedNew[id] || {}, ...t.pendingPatch };
+    }
+    for (const id in unsavedNew) {
+      if (!ids.has(id)) out.push(normalizeSong({ ...BLANK_SONG, ...unsavedNew[id], id }));
+    }
+    return out;
+  }
+  function recoverHeldEdits(serverSongs) {
+    const held = unrecoveredEditsRef.current;
+    if (!held) return;
+    const ids = new Set(serverSongs.map((s) => s.id));
+    Object.keys(held.patches).forEach((id) => {
+      const isNew = held.newIds.indexOf(id) !== -1 && !ids.has(id);
+      if (!ids.has(id) && !isNew) return;
+      const existing = songSaveTimers.current[id] || {};
+      songSaveTimers.current[id] = {
+        ...existing,
+        pendingPatch: { ...held.patches[id], ...existing.pendingPatch || {}, id },
+        bases: { ...existing.bases || {}, ...(held.bases || {})[id] || {} },
+        isNew: !!existing.isNew || isNew,
+        debounce: existing.debounce || null,
+        retry: existing.retry || null
+      };
+    });
+    unrecoveredEditsRef.current = null;
+    persistPendingEdits();
+    if (held.legacyClaimed) {
+      try {
+        localStorage.removeItem(LEGACY_PENDING_EDITS_KEY);
+      } catch (e) {
+      }
+    }
+    setTimeout(() => {
+      for (const id in songSaveTimers.current) {
+        const t = songSaveTimers.current[id];
+        if (t && t.pendingPatch && !t.inFlight) attemptSongSaveFor(id);
+      }
+    }, 0);
+  }
+  function scheduleSongSave(id, patch, opts) {
     const existing = songSaveTimers.current[id] || {};
     if (existing.debounce) clearTimeout(existing.debounce);
     if (existing.retry) clearTimeout(existing.retry);
     const mergedPatch = { ...existing.pendingPatch || {}, ...patch, id };
+    const bases = { ...existing.bases || {} };
+    const cur = songsRef.current && songsRef.current.find((s) => s.id === id);
+    if (cur) {
+      SONG_LIST_FIELDS.forEach((f) => {
+        if (Object.prototype.hasOwnProperty.call(patch, f) && !Object.prototype.hasOwnProperty.call(bases, f)) {
+          bases[f] = Array.isArray(cur[f]) ? cur[f] : [];
+        }
+      });
+    }
     songSaveTimers.current[id] = {
       ...existing,
       // keep inFlight / retryCount if a save is running right now
       pendingPatch: mergedPatch,
+      bases,
+      isNew: !!(existing.isNew || opts && opts.isNew),
       debounce: setTimeout(() => attemptSongSaveFor(id), EDIT_IDLE_SAVE_MS),
       retry: null
     };
@@ -1530,8 +2250,27 @@ function App() {
   function scheduleSetlistSave(setlist) {
     runSetlistSave("meta:" + setlist.id, () => saveSetlistRemote(setlist));
   }
-  function scheduleSetlistSetsSave(id, sets) {
-    runSetlistSave("sets:" + id, () => saveSetlistSetsRemote(id, sets));
+  function scheduleSetlistSetsSave(id, sets, prevSets) {
+    const key = "sets:" + id;
+    const entry = setlistSaveTimers.current[key] || (setlistSaveTimers.current[key] = {});
+    if (entry.base === void 0) entry.base = prevSets || null;
+    entry.latestSets = sets;
+    const run = () => {
+      const base = entry.base;
+      return saveSetlistSetsRemote(id, sets, base).then((written) => {
+        entry.base = sets;
+        if (entry.latestSets === sets && written && !sameList(written, sets)) {
+          setSetlists((prev) => prev.map((sl) => sl.id === id ? { ...sl, sets: written } : sl));
+        }
+        if (entry.latestSets === sets) entry.base = void 0;
+      });
+    };
+    runSetlistSave(key, () => {
+      const p = (entry.chain || Promise.resolve()).catch(() => {
+      }).then(run);
+      entry.chain = p;
+      return p;
+    });
   }
   useEffect(() => {
     let cancelled = false;
@@ -1549,6 +2288,7 @@ function App() {
         }
       } catch (e) {
       }
+      unrecoveredEditsRef.current = readHeldEdits();
       let usedCache = false;
       try {
         const cacheRaw = localStorage.getItem(CACHE_KEY);
@@ -1558,7 +2298,7 @@ function App() {
             const cd = { ...cp, songs: cp.songs.map(normalizeSong) };
             if (!cancelled) {
               setIsBeta(!!cd.isBeta);
-              setSongs(cd.songs);
+              setSongs(songsWithLocalEdits(cd.songs));
               setSectionOrder(cd.sectionOrder);
               setSongOrder(cd.songOrder);
               const cSetlists = Array.isArray(cd.setlists) ? cd.setlists : [];
@@ -1615,43 +2355,8 @@ function App() {
         if (data.dataVersion != null) dataVersionRef.current = data.dataVersion;
         setIsBeta(!!data.isBeta);
         pruneChangeLog();
-        let recovered = null;
-        if (!usedCache) {
-          try {
-            const raw = localStorage.getItem(PENDING_EDITS_KEY);
-            if (raw) {
-              recovered = readRecoverablePatches(raw, Date.now());
-              if (!recovered) localStorage.removeItem(PENDING_EDITS_KEY);
-            }
-          } catch (e) {
-          }
-        }
-        const mergedSongs = data.songs.map((s) => {
-          let m = s;
-          if (recovered && recovered[s.id]) m = { ...m, ...recovered[s.id] };
-          const t = songSaveTimers.current[s.id];
-          if (t && t.pendingPatch) m = { ...m, ...t.pendingPatch };
-          return m;
-        });
-        setSongs(mergedSongs);
-        if (recovered) {
-          const songIds = new Set(data.songs.map((s) => s.id));
-          Object.keys(recovered).forEach((id) => {
-            if (!songIds.has(id)) return;
-            songSaveTimers.current[id] = {
-              pendingPatch: { ...recovered[id], id },
-              debounce: null,
-              retry: null
-            };
-          });
-          setTimeout(() => {
-            for (const id in songSaveTimers.current) {
-              if (songSaveTimers.current[id] && songSaveTimers.current[id].pendingPatch) {
-                attemptSongSaveFor(id);
-              }
-            }
-          }, 0);
-        }
+        setSongs(songsWithLocalEdits(data.songs));
+        recoverHeldEdits(data.songs);
         setSectionOrder(data.sectionOrder);
         setSongOrder(data.songOrder);
         const loadedSetlists = Array.isArray(data.setlists) ? data.setlists : [];
@@ -1784,12 +2489,8 @@ function App() {
         if (isManual) setManualRefreshing(false);
         return;
       }
-      const songsWithPendingApplied = data.songs.map((s) => {
-        let merged = s;
-        const t = songSaveTimers.current[s.id];
-        if (t && t.pendingPatch) merged = { ...merged, ...t.pendingPatch };
-        return merged;
-      });
+      const songsWithPendingApplied = songsWithLocalEdits(data.songs);
+      recoverHeldEdits(data.songs);
       const nextSetlists = Array.isArray(data.setlists) ? data.setlists : [];
       const nextDefaultId = data.defaultSetlistId && nextSetlists.some((sl) => sl.id === data.defaultSetlistId) ? data.defaultSetlistId : null;
       const changed = stableStringify(songsWithPendingApplied) !== stableStringify(songs) || stableStringify(data.sectionOrder) !== stableStringify(sectionOrder) || stableStringify(data.songOrder) !== stableStringify(songOrder) || stableStringify(nextSetlists) !== stableStringify(setlists) || nextDefaultId !== defaultSetlistId || stableStringify(data.sectionDefs) !== stableStringify(sectionDefs) || stableStringify(data.views) !== stableStringify(views);
@@ -1874,8 +2575,10 @@ function App() {
     function onControllerChange() {
       if (reloading) return;
       reloading = true;
-      saveReloadSnapshot();
-      forceFullReload();
+      runWhenReloadAllowed(function() {
+        saveReloadSnapshotRef.current();
+        forceFullReload();
+      });
     }
     navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
     return function() {
@@ -2166,8 +2869,9 @@ function App() {
   function persistActiveSetlistSets(nextSets) {
     if (!activeSetlistId) return;
     const sets = normalizeSets(nextSets);
-    setSetlists((prev) => prev.map((sl) => sl.id === activeSetlistId ? { ...sl, sets } : sl));
-    scheduleSetlistSetsSave(activeSetlistId, sets);
+    const prev = setlists.find((sl) => sl.id === activeSetlistId);
+    setSetlists((p) => p.map((sl) => sl.id === activeSetlistId ? { ...sl, sets } : sl));
+    scheduleSetlistSetsSave(activeSetlistId, sets, prev ? prev.sets : null);
   }
   function setsFromMap(map, names) {
     const clean = (names || slSectionOrder).filter((n) => n && n !== "Not In Show");
@@ -2181,7 +2885,7 @@ function App() {
     const id = uid();
     const newSong = { ...BLANK_SONG, id, section: "", title: "New Song" };
     setSongs((prev) => [...prev, newSong]);
-    scheduleSongSave(id, newSong);
+    scheduleSongSave(id, newSong, { isNew: true });
     if (activeTab === "Setlist" && activeSetlistId) {
       const first = slSectionOrder[0];
       persistActiveSetlistSets(setsFromMap({ ...slSongOrder, [first]: [...slSongOrder[first] || [], id] }, slSectionOrder));
@@ -2194,7 +2898,7 @@ function App() {
       (prev) => prev.map((sl) => {
         const sets = (sl.sets || []).map((sec) => ({ ...sec, songIds: (sec.songIds || []).filter((x) => x !== id) }));
         const had = (sl.sets || []).some((sec) => (sec.songIds || []).includes(id));
-        if (had) scheduleSetlistSetsSave(sl.id, sets);
+        if (had) scheduleSetlistSetsSave(sl.id, sets, sl.sets);
         return had ? { ...sl, sets } : sl;
       })
     );
@@ -2450,7 +3154,7 @@ function App() {
       onClose: () => setShowDriveReviewScreen(false),
       onOpenFolderSettings: () => setShowDriveFolderSettings(true),
       onScan: async () => {
-        const scanResult = await scanDriveLinksRemote();
+        const scanResult = await scanDriveLinksRemote(songsRef.current);
         if (scanResult && scanResult.error) {
           alert("Drive scan problem:\n\n" + scanResult.error);
           return;
@@ -2464,49 +3168,15 @@ function App() {
             alreadyLinked: scanResult.alreadyLinked || 0,
             staleRemoved: scanResult.staleRemoved || 0
           });
-          if (scanResult.allSongRecordings && scanResult.allSongRecordings.length > 0) {
-            const client = getSupabaseClient();
-            for (const entry of scanResult.allSongRecordings) {
-              try {
-                const cur = await client.from("songs").select("recording").eq("id", entry.id).single();
-                const supaRecs = cur.data && cur.data.recording || [];
-                const sheetRecs = entry.recording || [];
-                const sheetFileIds = /* @__PURE__ */ new Set();
-                for (const r of sheetRecs) {
-                  const fid = driveFileIdFromUrl(r.url);
-                  if (fid) sheetFileIds.add(fid);
-                }
-                let merged = supaRecs.filter((r) => {
-                  const fid = driveFileIdFromUrl(r.url);
-                  if (!fid) return true;
-                  return sheetFileIds.has(fid);
-                });
-                const existingIds = /* @__PURE__ */ new Set();
-                for (const r of merged) {
-                  const fid = driveFileIdFromUrl(r.url);
-                  if (fid) existingIds.add(fid);
-                }
-                let added = 0;
-                for (const r of sheetRecs) {
-                  const fid = driveFileIdFromUrl(r.url);
-                  if (fid && existingIds.has(fid)) continue;
-                  if (!fid && merged.some((s) => s.url === r.url)) continue;
-                  merged.push(r);
-                  added++;
-                }
-                const removed = supaRecs.length - (merged.length - added);
-                if (added > 0 || removed > 0) {
-                  await supabaseCall(
-                    "driveScanSync",
-                    () => saveSongPatchToSupabase({ id: entry.id, recording: merged })
-                  );
-                }
-              } catch (e) {
-                console.warn("Failed to sync recordings to Supabase:", entry.id, e);
-              }
-            }
+          if (scanResult.toAdd || scanResult.staleFileIds) {
+            (songsRef.current || []).forEach((s) => {
+              const recs = s.recording || [];
+              const next = mergeDriveScanIntoRecordings(recs, (scanResult.toAdd || {})[s.id], scanResult.staleFileIds);
+              if (next !== recs) updateSong(s.id, { recording: next });
+            });
+          } else {
+            refreshAllData(false);
           }
-          refreshAllData(false);
         } else {
           alert("No Drive folder is saved yet \u2014 open Drive folder settings and save the folder link again.");
         }
@@ -2705,7 +3375,7 @@ function App() {
       },
       onClose: () => setShowCopySheet(false)
     }
-  ), /* @__PURE__ */ React.createElement(UploadToast, { upload: bgUpload, onRetry: retryBgUpload, onDismiss: dismissBgUpload }), toast && /* @__PURE__ */ React.createElement("div", { style: styles.toast }, toast)));
+  ), /* @__PURE__ */ React.createElement(UploadToast, { uploads, onRetry: retryUpload, onRetryNow: retryUploadsNow, onDiscard: discardUpload, onSaveCopy: saveUploadCopy }), toast && /* @__PURE__ */ React.createElement("div", { style: styles.toast }, toast)));
 }
 function ViewPickerModal({ views, currentViewId, onPick }) {
   return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop }, /* @__PURE__ */ React.createElement("div", { style: styles.modalCard }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, "Who's viewing?"), /* @__PURE__ */ React.createElement("div", { style: styles.modalSubtitle }, "Pick your view for this session."), /* @__PURE__ */ React.createElement("div", { style: styles.viewPickerList }, VIEW_IDS.map((vid) => {
@@ -2827,7 +3497,23 @@ function SyncIndicator({ status, compact }) {
     return /* @__PURE__ */ React.createElement("span", { style: { ...base, color: "var(--ready)", display: "flex", alignItems: "center", gap: 4 } }, /* @__PURE__ */ React.createElement(Icon, { name: "refresh", size: compact ? 11 : 13 }), " synced");
   return /* @__PURE__ */ React.createElement("span", { style: { ...base, opacity: 0 } }, "\xB7");
 }
+function useBrowserOnline() {
+  const [online, setOnline] = useState(() => typeof navigator === "undefined" || navigator.onLine !== false);
+  useEffect(() => {
+    const up = () => setOnline(true);
+    const down = () => setOnline(false);
+    window.addEventListener("online", up);
+    window.addEventListener("offline", down);
+    return () => {
+      window.removeEventListener("online", up);
+      window.removeEventListener("offline", down);
+    };
+  }, []);
+  return online;
+}
 function StatusDot({ saveState, syncStatus, lastError }) {
+  const online = useBrowserOnline();
+  if (saveState === "saving" && !online) saveState = "offline";
   let color, label, pulse;
   if (saveState === "offline" || syncStatus === "error") {
     color = "var(--needs)";
@@ -3648,6 +4334,7 @@ function Metronome({ bpm, onSetBpm }) {
   ), /* @__PURE__ */ React.createElement("button", { type: "button", style: styles.metroTap, onClick: handleTap }, "Tap")), /* @__PURE__ */ React.createElement("div", { style: styles.metroHint }, hint));
 }
 function LinksListEditor({ value, onChange, onFieldBlur, songId, songTitle, hideAddLink, hideInternalButtons }) {
+  const uploadCtx = React.useContext(UploadContext);
   const links = value || [];
   const byId = useMemo(() => Object.fromEntries(links.map((l) => [l.id, l])), [links]);
   const [localOrder, setLocalOrder] = useState(links.map((l) => l.id));
@@ -3677,7 +4364,8 @@ function LinksListEditor({ value, onChange, onFieldBlur, songId, songTitle, hide
         setDelBusyId(null);
         return;
       }
-      onChange((value || []).filter((x) => x.id !== link.id));
+      if (uploadCtx && uploadCtx.removeDriveFileEverywhere && fid) uploadCtx.removeDriveFileEverywhere(fid);
+      else onChange((value || []).filter((x) => x.id !== link.id));
       setDelBusyId(null);
       closeDelMenu();
     } catch (e) {
@@ -3812,6 +4500,12 @@ function AddRecordingSheet({ songId, songTitle, onClose }) {
   const [name, setName] = useState("Recording");
   const [phase, setPhase] = useState("idle");
   const [errMsg, setErrMsg] = useState("");
+  const [saving, setSaving] = useState(false);
+  const hasFile = !!file;
+  useEffect(() => {
+    if (!hasFile) return;
+    return holdAutoReload();
+  }, [hasFile]);
   useEffect(() => {
     return () => {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
@@ -3838,15 +4532,15 @@ function AddRecordingSheet({ songId, songTitle, onClose }) {
     setPhase("picked");
     setErrMsg("");
   }
-  function upload() {
-    if (!file || uploadCtx && uploadCtx.busy) return;
-    var started = uploadCtx && uploadCtx.startUpload(songId, songTitle, file, {
-      songId,
+  async function upload() {
+    if (!file || saving || !uploadCtx) return;
+    setSaving(true);
+    await uploadCtx.startUpload(songId, songTitle, file, {
       filename: file.name || "",
       mimeType: file.type || "audio/mp4",
       name: name.trim() || "Recording"
     });
-    if (started) onClose();
+    onClose();
   }
   return /* @__PURE__ */ React.createElement("div", { style: styles.modalBackdrop, onClick: onClose }, /* @__PURE__ */ React.createElement("div", { style: styles.modalCard, onClick: (e) => e.stopPropagation() }, /* @__PURE__ */ React.createElement("div", { style: styles.modalTitle }, "Add audio"), /* @__PURE__ */ React.createElement("div", { style: styles.manualLinkFileName }, songTitle), /* @__PURE__ */ React.createElement(
     "input",
@@ -3876,9 +4570,9 @@ function AddRecordingSheet({ songId, songTitle, onClose }) {
     "button",
     {
       onClick: upload,
-      style: { ...styles.modalConfirm, ...uploadCtx && uploadCtx.busy ? { opacity: 0.6, pointerEvents: "none" } : {} }
+      style: { ...styles.modalConfirm, ...saving ? { opacity: 0.6, pointerEvents: "none" } : {} }
     },
-    uploadCtx && uploadCtx.busy ? "Upload in progress\u2026" : "Upload"
+    saving ? "Saving\u2026" : "Upload"
   ))), /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { ...styles.modalCancel, width: "100%", flex: "none", marginTop: 14 } }, file ? "Cancel" : "Close")));
 }
 function humanSize(bytes) {
@@ -3965,6 +4659,13 @@ function RecordSheet({ songId, songTitle, existingNames, onClose, onChooseFile }
   const [errMsg, setErrMsg] = useState("");
   const [armCancel, setArmCancel] = useState(false);
   const [armRedo, setArmRedo] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [armClose, setArmClose] = useState(false);
+  const holdsReload = phase === "recording" || !!blob;
+  useEffect(() => {
+    if (!holdsReload) return;
+    return holdAutoReload();
+  }, [holdsReload]);
   const mrRef = useRef(null);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
@@ -4088,9 +4789,9 @@ function RecordSheet({ songId, songTitle, existingNames, onClose, onChooseFile }
   const cleanName = name.trim() || "Recording";
   const base = cleanName.toLowerCase().indexOf(song.toLowerCase()) === 0 ? cleanName : song + " " + cleanName;
   const previewFilename = base + "." + recMimeToExt(mimeType || pickRecMime());
-  const canDismiss = phase === "idle" || phase === "denied" || phase === "review" || phase === "error";
-  function save() {
-    if (!blob || uploadCtx && uploadCtx.busy) return;
+  const canDismiss = !saving && !blob && (phase === "idle" || phase === "denied" || phase === "error");
+  async function save() {
+    if (!blob || saving || !uploadCtx) return;
     if (blob.size > MAX_UPLOAD_BYTES) {
       setPhase("error");
       setErrMsg(
@@ -4098,13 +4799,13 @@ function RecordSheet({ songId, songTitle, existingNames, onClose, onChooseFile }
       );
       return;
     }
-    var started = uploadCtx && uploadCtx.startUpload(songId, songTitle, blob, {
-      songId,
+    setSaving(true);
+    await uploadCtx.startUpload(songId, songTitle, blob, {
       filename: cleanName + "." + recMimeToExt(mimeType),
       mimeType: mimeType || "audio/mp4",
       name: cleanName
     });
-    if (started) onClose();
+    onClose();
   }
   const bigCircle = {
     width: 92,
@@ -4153,7 +4854,17 @@ function RecordSheet({ songId, songTitle, existingNames, onClose, onChooseFile }
       style: { ...styles.modalCancel, color: "var(--needs)", borderColor: "rgba(217,112,74,0.5)" }
     },
     armRedo ? "Tap again \u2014 discard" : "Re-record"
-  ), /* @__PURE__ */ React.createElement("button", { onClick: save, style: { ...styles.modalConfirm, ...uploadCtx && uploadCtx.busy ? { opacity: 0.6, pointerEvents: "none" } : {} } }, uploadCtx && uploadCtx.busy ? "Upload in progress\u2026" : phase === "error" ? "Try again" : "Save"))), (phase === "review" || phase === "error") && /* @__PURE__ */ React.createElement("button", { onClick: onClose, style: { ...styles.modalCancel, width: "100%", flex: "none", marginTop: 12 } }, "Discard & close")));
+  ), /* @__PURE__ */ React.createElement("button", { onClick: save, style: { ...styles.modalConfirm, ...saving ? { opacity: 0.6, pointerEvents: "none" } : {} } }, saving ? "Saving\u2026" : phase === "error" ? "Try again" : "Save"))), (phase === "review" || phase === "error") && !saving && /* @__PURE__ */ React.createElement(
+    "button",
+    {
+      onClick: () => {
+        if (!blob || armClose) onClose();
+        else setArmClose(true);
+      },
+      style: { ...styles.modalCancel, width: "100%", flex: "none", marginTop: 12, ...armClose ? { color: "var(--needs)", borderColor: "rgba(217,112,74,0.5)" } : {} }
+    },
+    armClose ? "Tap again \u2014 discard recording" : blob ? "Discard & close" : "Close"
+  )));
 }
 function ArrangementTable({ rows, onChange, colPct, onColPctChange, editMode, onFieldBlur }) {
   const rowsById = useMemo(() => Object.fromEntries(rows.map((r) => [r.id, r])), [rows]);
