@@ -243,7 +243,8 @@
       if (store && !song && state.lySong && loadingId !== state.lySong) openSong(state.lySong);
       if (!song) return `${storeProblem ? problemBox() : '<div class="sw-wempty">Opening…</div>'}`;
       var o = order(), lab = labels(o, secs);
-      return `<div class="sw-songbar">${ctx.singleSong ? '' : '<button class="sw-back" data-act="ed-back" aria-label="Back to songs">‹</button>'}
+      return `<div class="sw-wordslot"><div class="sw-wordbar" data-wordbar hidden></div></div>
+        <div class="sw-songbar">${ctx.singleSong ? '' : '<button class="sw-back" data-act="ed-back" aria-label="Back to songs">‹</button>'}
           ${ctx.singleSong ? '<span class="sw-grow"></span>'   /* inside a Setlist song page, which already shows the title */
             : store.canRename === false ? `<div class="sw-title sw-keepcase">${esc(song.title || 'Untitled')}</div>`
             : `<input class="sw-title sw-keepcase" data-title value="${esc(song.title || '')}" placeholder="Song title" autocomplete="off">`}
@@ -252,8 +253,7 @@
         <div class="sw-secs ${showCounts ? '' : 'sw-nocounts'}">${o.map(function (id) { return sectionCard(id, lab); }).join('')}</div>
         <button class="sw-addsec" data-act="ed-add">+ Add section</button>
         ${showCounts ? '<div class="sw-legend"><span>8 = syllables</span><span><b>A</b> = rhymes</span><span>dashed = near · dotted = vowel</span><span>tap a letter to change</span></div>' : '<div class="sw-legend"></div>'}
-        ${undoBar()}
-        <div class="sw-wordbar" data-wordbar hidden></div>`;
+        ${undoBar()}`;
     }
 
     function undoBar() {
@@ -441,7 +441,7 @@
       var bar = ctx.el.querySelector('[data-wordbar]');
       if (!bar) return;
       var w = ta && document.activeElement === ta ? wordAtCursor(ta) : '';
-      if (!w) { bar.hidden = true; barWord = ''; return; }
+      if (!w) { bar.hidden = true; barWord = ''; var a = scrollParent(ctx.el); if (a) a.style.scrollPaddingTop = ''; return; }
       bar.hidden = false;
       placeBar(bar);
       if (w === barWord) return;
@@ -451,23 +451,22 @@
         <span class="sw-wbtns">${[['rhymes', 'Rhymes'], ['syn', 'Syn'], ['ant', 'Ant'], ['def', 'Meaning']].map(function (t) {
           return `<button data-act="ed-word" data-arg="${t[0]}">${t[1]}</button>`; }).join('')}<button class="sw-wletter" data-act="ed-pickword" aria-label="Give this word a rhyme letter">A·B</button></span>`;
     }
-    // Newer iPhones float their own ^ ˅ ✓ bar (~50pt) just above the keyboard, over the page; a page can't
-    // move or hide it. So on iPhone/iPad the word bar sits that much higher while the keyboard is up.
-    // (On older iOS, where that bar is part of the keyboard, this leaves a small gap.)
-    var IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-    var IOS_BAR_PX = 50;
-
-    /** Keep the word bar just above the keyboard (and above iOS's own bar). */
-    function placeBar(bar) {
-      var vv = root.visualViewport;
-      var keyboard = vv && vv.height < root.innerHeight * 0.8;   // the visible area shrank: a keyboard is up
-      var bottom = vv ? Math.max(0, root.innerHeight - vv.height - vv.offsetTop) : 0;
-      bar.style.bottom = (bottom + (keyboard && IOS ? IOS_BAR_PX : 0)) + 'px';
+    /** The word bar is pinned to the top of the lyrics' scrolling area (in the Setlist app: right under the
+        song tabs) by CSS alone: .sw-wordslot is position: sticky, first thing on the page, zero height, so
+        the bar floats over the lyrics without pushing them down. Alex's call (2.0.8.1); it used to sit just
+        above the keyboard. Measuring the screen instead broke on iPhone: with the keyboard up, iOS reports
+        the visible area's position in a way that put the bar ~100px too low (2.0.8.1-beta1). */
+    function scrollParent(el) {
+      for (var s = el.parentElement; s; s = s.parentElement) {
+        var oy = getComputedStyle(s).overflowY;
+        if (oy === 'auto' || oy === 'scroll') return s;
+      }
+      return null;
     }
-    if (root.visualViewport) {
-      var onVV = function () { var bar = ctx.el.querySelector('[data-wordbar]'); if (bar && !bar.hidden) placeBar(bar); };
-      ctx.on(root.visualViewport, 'resize', onVV);
-      ctx.on(root.visualViewport, 'scroll', onVV);
+    /** Keep the line being typed from hiding under the bar when the browser scrolls to the cursor. */
+    function placeBar(bar) {
+      var area = scrollParent(ctx.el);
+      if (area) area.style.scrollPaddingTop = bar.offsetHeight + 'px';
     }
 
     ctx.el.addEventListener('input', function (e) {
