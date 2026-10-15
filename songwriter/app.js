@@ -23,6 +23,8 @@
   const SNAPSHOT_KEY = 'songwriter_reloadSnapshot';   // keeps your work through an automatic update
   const DRAG_START_PX = 6;   // a finger has to move this far before a tap becomes a drag
   const WORDS_URL = 'words.js';   // the rhyme word list (~0.5 MB), loaded the first time Lyrics opens
+  const SAYINGS_URL = 'sayings.js';   // idioms, proverbs and similes from Wiktionary (~75 KB), loaded the first time Related opens
+  const LYRICWORDS_URL = 'lyricwords.js';   // how often each of those words is sung (35 KB): the lyric bump
   const DEFINITIONS_URL = 'definitions.js';   // meanings with examples (~2.7 MB), loaded the first time Meaning opens
   const THESAURUS_URL = 'thesaurus.js';   // synonyms & antonyms by meaning (~1.8 MB), loaded the first time they're asked for
   const DATAMUSE = 'https://api.datamuse.com/words';   // extra related words (needs internet)
@@ -33,7 +35,8 @@
   ];
   // First batch shown in each word-sheet tab; the rest is one tap away ("Show N more").
   // Rhymes count per kind (perfect, family, vowel), so lots of perfect rhymes can't hide the family ones.
-  const FIRST = { rhymes: 30, phrases: 12, syn: 40, ant: 40, def: 4 };
+  const FIRST = { rhymes: 30, phrases: 12, syn: 40, ant: 40, def: 4, rel: 24, 'rel-phrases': 12, 'rel-similes': 8 };   // rel: per Related group
+  const ONLINE_TABS = ['syn', 'ant', 'rel'];   // tabs that also ask Datamuse when they open
 
   function mount(el, options) {
     const opts = options || {};
@@ -61,7 +64,7 @@
       lyRecent: [],          // words looked up this visit, newest first
       word: null,            // word shown in the word sheet
       wordTrail: [],         // words looked up before it from inside the sheet (for ‹ Back)
-      wordTab: 'rhymes',     // 'rhymes' | 'syn' | 'ant' | 'def'
+      wordTab: 'rhymes',     // 'rhymes' | 'syn' | 'ant' | 'def' | 'rel'
       strict: 1,             // rhyme strictness: 0 Perfect, 1 Family, 2 Vowel
       showHidden: false,     // Synonyms/Antonyms: vulgar words shown at the bottom
       showAll: {},           // word-sheet tabs showing everything, not just the first batch: { rhymes: true }
@@ -89,6 +92,8 @@
     let dictState = 'idle';   // 'idle' | 'loading' | 'ready'
     let th = null;            // the offline thesaurus, once thesaurus.js has loaded
     let thState = 'idle';
+    let say = null;           // sayings and similes, once sayings.js has loaded
+    let sayState = 'idle';
     let defs = null;          // definitions, once definitions.js has loaded
     let defState = 'idle';
     const dmCache = {};       // Datamuse answers: { 'syn:stop': { status, words } }
@@ -397,9 +402,21 @@
     }
     function needWords() {
       if (dictState !== 'idle') return;
-      if (SW.WORDS) { dict = R.load(SW.WORDS); dictState = 'ready'; return; }
+      const ready = () => { dict = R.addLyrics(R.load(SW.WORDS), SW.LYRICWORDS); dictState = 'ready'; };
+      if (SW.WORDS && SW.LYRICWORDS) { ready(); return; }
       dictState = 'loading';
-      loadScript(BASE + WORDS_URL, () => { dict = R.load(SW.WORDS); dictState = 'ready'; render(); }, () => { dictState = 'idle'; render(); });
+      // The sung-word counts come second and are optional: without them the lists just skip the lyric bump.
+      const lyrics = () => SW.LYRICWORDS ? (ready(), renderUnlessTyping())
+        : loadScript(BASE + LYRICWORDS_URL, () => { ready(); renderUnlessTyping(); }, () => { ready(); renderUnlessTyping(); });
+      if (SW.WORDS) { lyrics(); return; }
+      loadScript(BASE + WORDS_URL, lyrics, () => { dictState = 'idle'; renderUnlessTyping(); });
+    }
+    function needSayings() {
+      if (sayState !== 'idle') return;
+      if (SW.SAYINGS) { say = R.loadSayings(SW.SAYINGS); sayState = 'ready'; return; }
+      sayState = 'loading';
+      // Optional: if it can't load (offline the first time), Related just goes without sayings.
+      loadScript(BASE + SAYINGS_URL, () => { say = R.loadSayings(SW.SAYINGS); sayState = 'ready'; render(); }, () => { sayState = 'failed'; render(); });
     }
     function needThesaurus() {
       if (thState !== 'idle') return;
@@ -442,8 +459,11 @@
       state.wordPron = -1;
       state.lyRecent = [w].concat(state.lyRecent.filter((x) => x !== w)).slice(0, 10);
       needWords();
-      if (state.wordTab === 'syn' || state.wordTab === 'ant') fetchWords(state.wordTab, w);
+      if (ONLINE_TABS.includes(state.wordTab)) fetchWords(state.wordTab, w);
     }
+
+    /** How often a word is sung, 0 … 1, for the lyric bump (null until the word list is in). */
+    const sung = (w) => (dictState === 'ready' ? R.lyricOf(dict, w) : null);
 
     /** Extra related words or opposites from Datamuse, sorted best first (SW.rhymes ranks them).
         Shown under the offline thesaurus groups. Redraws when the answer arrives. */
@@ -461,10 +481,21 @@
           .then(() => { if (state.sheet === 'word' && state.word === word && state.wordTab === kind) render(); });
         return;
       }
+      // Related: Datamuse's raw answers are kept; they're sorted when shown (that needs the word list).
+      if (kind === 'rel') {
+        const qs = { me: `sp=${w}&md=pf&max=1`, pre: `sp=*%20${w}&md=f&max=100`, post: `sp=${w}%20*&md=f&max=100`, mid: `sp=*%20${w}%20*&md=f&max=100`, jjb: `rel_jjb=${w}&md=pf&max=100`, jja: `rel_jja=${w}&md=pf&max=100`,
+          after: `lc=${w}&sp=*&md=pf&max=100`, before: `rc=${w}&sp=*&md=pf&max=100`, trg: `rel_trg=${w}&md=pf&max=100`, ml: `ml=${w}&md=pf&max=100` };
+        const keys = Object.keys(qs);
+        Promise.all(keys.map((k) => ask(qs[k])))
+          .then((lists) => { const raw = {}; keys.forEach((k, i) => { raw[k] = lists[i]; }); dmCache[key] = { status: 'ok', words: raw }; })
+          .catch(() => { dmCache[key] = { status: 'error', words: [] }; })
+          .then(() => { if (state.sheet === 'word' && state.word === word && state.wordTab === kind) render(); });
+        return;
+      }
       const done = kind === 'syn'
         ? Promise.all([ask(`sp=${w}&md=p&max=1`), ask(`rel_syn=${w}&md=fp&max=100`), ask(`ml=${w}&md=fp&max=150`)])
-          .then(([me, syns, related]) => R.rankSynonyms(word, me[0], syns, related))
-        : ask(`rel_ant=${w}&md=f&max=50`).then((ants) => R.rankAntonyms(word, ants));
+          .then(([me, syns, related]) => R.rankSynonyms(word, me[0], syns, related, 0, sung))
+        : ask(`rel_ant=${w}&md=f&max=50`).then((ants) => R.rankAntonyms(word, ants, sung));
       done.then((words) => { dmCache[key] = { status: 'ok', words }; })
         .catch(() => { dmCache[key] = { status: 'error', words: [] }; })
         .then(() => { if (state.sheet === 'word' && state.word === word && state.wordTab === kind) render(); });
@@ -473,7 +504,7 @@
     /** The first batch of a list for a tab, plus "Show N more" (or "Show fewer" once it's open).
         kindOf (optional) splits the batch by kind: the first N of each kind are shown. */
     function firstBatch(tab, list, kindOf) {
-      const n = FIRST[tab], seen = {};
+      const n = FIRST[tab] || FIRST[tab.split('-')[0]], seen = {};
       const first = kindOf ? list.filter((x) => { const k = kindOf(x); seen[k] = (seen[k] || 0) + 1; return seen[k] <= n; }) : list.slice(0, n);
       const extra = list.length - first.length;
       if (!extra) return { list, more: '' };
@@ -580,18 +611,47 @@
         </div>`).join('')}</div>${batch.more}${from}`;
     }
 
+    /** Related: words that go with this one, in groups (SW.rhymes.rankRelated). Online only (Datamuse).
+        Vulgar words are left out unless the word itself is one. */
+    function relatedTab() {
+      needThesaurus();
+      needSayings();
+      if (dictState !== 'ready' || thState !== 'ready' || sayState === 'loading') return '<div class="sw-wempty">Loading the word list…</div>';
+      const got = dmCache[`rel:${state.word}`];
+      if (!got) fetchWords('rel', state.word);
+      // Similes and sayings are on the phone, so they show right away (and offline); Datamuse's groups join when they arrive.
+      const online = got && got.status === 'ok' ? got.words : {};
+      const typed = R.clean(state.word), keepVulgar = R.isVulgar(th, typed);
+      const groups = R.rankRelated(dict, state.word, online.me && online.me[0], online, say)
+        .map((g) => ({ id: g.id, label: g.label, words: keepVulgar ? g.words : g.words.filter((x) => !x.toLowerCase().split(/[^a-z]+/).some((p) => R.isVulgar(th, p))) }))
+        .filter((g) => g.words.length);
+      const offline = navigator.onLine === false;
+      const status = !got || got.status === 'loading' ? 'Looking for more online…'
+        : got.status === 'error' ? (offline ? 'Connect to the internet for describing words and more.' : '<button class="sw-link" data-act="word-retry">Look online again</button>') : '';
+      const credit = groups.some((g) => g.id === 'similes' || g.id === 'phrases') ? ' Sayings and similes from Wiktionary (CC BY-SA).' : '';
+      if (!groups.length) {
+        return !got || got.status === 'loading' ? '<div class="sw-wempty">Looking it up online…</div>'
+          : `<div class="sw-wempty">No related words found for “${esc(state.word)}”. ${status}</div>`;
+      }
+      return `<div class="sw-wlist">${groups.map((g) => {
+        const batch = firstBatch(`rel-${g.id}`, g.words);
+        return `<div class="sw-sub">${g.label}</div>${wordButtons(batch.list)}${batch.more}`;
+      }).join('')}</div><div class="sw-wnote">Best first. Tap a word to look it up.${credit} ${status}</div>`;
+    }
+
+
     function wordSheet() {
       const syl = dictState === 'ready' ? R.syllables(dict, state.word) : 0;
       const back = state.wordTrail.length
         ? `<button class="sw-wback" data-act="word-back">‹ ${esc(state.wordTrail[state.wordTrail.length - 1])}</button>` : '';
-      const body = state.wordTab === 'rhymes' ? rhymesTab() : state.wordTab === 'def' ? meaningTab() : wordsTab(state.wordTab);
+      const body = state.wordTab === 'rhymes' ? rhymesTab() : state.wordTab === 'def' ? meaningTab() : state.wordTab === 'rel' ? relatedTab() : wordsTab(state.wordTab);
       return `<div class="sw-dimmer" data-act="close-sheet"></div>
         <div class="sw-sheet sw-wsheet">
           <div class="sw-sheet-head" data-sheet-grab><div class="sw-grab"></div>
             ${back}
             <div class="sw-whead"><b class="sw-keepcase">${esc(state.word)}</b>${syl ? `<span>${syl} syllable${syl > 1 ? 's' : ''}</span>` : ''}<button class="sw-x" data-act="close-sheet" aria-label="Close">✕</button></div>
           </div>
-          ${seg('word-tab', [['rhymes', 'Rhymes'], ['syn', 'Synonyms'], ['ant', 'Antonyms'], ['def', 'Meaning']], state.wordTab, 'sw-wide sw-4tabs')}
+          ${seg('word-tab', [['rhymes', 'Rhymes'], ['syn', 'Synonyms'], ['ant', 'Antonyms'], ['def', 'Meaning'], ['rel', 'Related']], state.wordTab, 'sw-wide sw-5tabs')}
           ${body}
         </div>`;
     }
@@ -747,10 +807,10 @@
         case 'show-hidden': state.showHidden = true; break;
         case 'show-all': state.showAll[arg] = true; break;
         case 'show-less': state.showAll[arg] = false; break;
-        case 'word-back': state.word = state.wordTrail.pop(); state.showHidden = false; state.showAll = {}; state.wordPron = -1; if (state.wordTab === 'syn' || state.wordTab === 'ant') fetchWords(state.wordTab, state.word); break;
+        case 'word-back': state.word = state.wordTrail.pop(); state.showHidden = false; state.showAll = {}; state.wordPron = -1; if (ONLINE_TABS.includes(state.wordTab)) fetchWords(state.wordTab, state.word); break;
         case 'word-tab':
           state.wordTab = arg;
-          if (arg === 'syn' || arg === 'ant') fetchWords(arg, state.word);
+          if (ONLINE_TABS.includes(arg)) fetchWords(arg, state.word);
           break;
         case 'word-retry': fetchWords(state.wordTab, state.word); break;
         case 'strict': state.strict = +arg; break;
@@ -1011,6 +1071,10 @@
     on(document, 'pointerup', endSheetDrag);
     on(document, 'pointercancel', endSheetDrag);
 
+    /** A full redraw replaces the lyrics box, which closes the phone's keyboard. While someone is typing
+        lyrics, the editor refreshes what it shows in place instead (2.0.8.2: the lyrics are always a box). */
+    function renderUnlessTyping() { if (state.area === 'lyrics' && editor.typing()) editor.refresh(); else render(); }
+
     // ---------- Lyrics: songs list and editor (editor.js) ----------
     const editor = SW.editor.create({
       el, state, render, esc, findBox, on,
@@ -1019,13 +1083,13 @@
       openWord: (word, tab) => {
         lookup(word, false);
         state.wordTab = tab;
-        if (tab === 'syn' || tab === 'ant') fetchWords(tab, state.word);
+        if (ONLINE_TABS.includes(tab)) fetchWords(tab, state.word);
       }
     });
 
     // ---------- Start ----------
     let resizeTimer;
-    on(root, 'resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(render, 120); });
+    on(root, 'resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderUnlessTyping, 120); });
     on(landMq, 'change', render);
     on(deskMq, 'change', render);
     render();

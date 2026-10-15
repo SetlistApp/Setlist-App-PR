@@ -201,8 +201,32 @@
     'theirs this that these those and or but if as so than then which what who whom whose says said can ' +
     'could would should will shall may might must just ' +
     'uh um huh hmm mm ah eh er erm uhh umm').split(' ').forEach(function (w) { GRAMMAR_WORDS[w] = true; });   // + filler sounds
+  // ---------- Lyric bump (lyricwords.js) ----------
+  // How often each word is sung (musiXmatch song-lyric counts), 0 … 1. Every word-sheet list uses it
+  // as a small push up for words songs actually use, never as the whole sort (or every list would
+  // start love, baby, heart).
+  var LYRIC_DIGITS = '0123456789abcdefghijklmnopqrstuvwxyz';
+  /** Adds the sung-word counts to a loaded word list (ignored if they were made for another list). */
+  function addLyrics(dict, code) {
+    if (code && code.length === dict.words.length) dict.lyric = code;
+    return dict;
+  }
+  function lyricAt(dict, j) { return LYRIC_DIGITS.indexOf(dict.lyric[j]) / 35; }
+  /** How often a word is sung, 0 … 1 (0 for words not in the list). A phrase counts as its least-sung
+      real word ("heart of gold" → gold). null when the counts aren't loaded. */
+  function lyricOf(dict, word) {
+    if (!dict || !dict.lyric) return null;
+    var all = clean(word).split(/[^a-z']+/).filter(Boolean);
+    var parts = all.filter(function (p) { return !GRAMMAR_WORDS[p]; });
+    if (!parts.length) parts = all;
+    return Math.min.apply(null, parts.map(function (p) { var j = find(dict, p); return j >= 0 && dict.real[j] && p.indexOf("'") < 0 ? lyricAt(dict, j) : 0; }));
+  }
   function usability(dict, j) {
     var w = dict.words[j], u = 1 - Math.log(j + 1) / Math.log(dict.words.length + 1);   // most common word → 1
+    // Lyric bump: sung words a bit higher. Contractions were counted as their first word (why're = why),
+    // so they get a middling count; names and foreign words get none (the song counts include other
+    // languages, so "hier" and "se" would look sung).
+    if (dict.lyric) u = 0.75 * u + 0.25 * (!dict.real[j] ? 0 : w.indexOf("'") >= 0 ? 0.5 : lyricAt(dict, j));
     if (!dict.real[j]) u *= 0.35;                                                       // names, foreign words, abbreviations
     if (w.indexOf("'") >= 0) u *= 0.9;                                                  // contractions, a little lower
     return u;
@@ -539,8 +563,9 @@
 
   /** Synonyms, best first. me = Datamuse's own entry for the word (for its part of speech),
       syns = rel_syn answers, related = ml ("means like") answers in Datamuse's order.
-      maxCommon (optional) limits the common words; rare ones always follow, all of them. */
-  function rankSynonyms(word, me, syns, related, maxCommon) {
+      maxCommon (optional) limits the common words; rare ones always follow, all of them.
+      sung (optional): word → how often it's sung, 0 … 1 (lyricOf), for the lyric bump. */
+  function rankSynonyms(word, me, syns, related, maxCommon, sung) {
     var myPos = me && me.word === word ? posOf(me) : null;
     var strict = {}, all = {};
     syns.forEach(function (x) { strict[x.word] = true; });
@@ -548,7 +573,9 @@
     syns.forEach(function (x) { if (!all[x.word]) all[x.word] = { x: x, rel: 0.3 }; });
     return Object.keys(all).map(function (k) { return all[k]; }).filter(function (o) { return usable(word)(o.x); })
       .map(function (o) {
-        var score = 0.45 * o.rel + 0.3 * popularity(freqOf(o.x)) + (strict[o.x.word] ? 0.25 : 0) + (myPos && posOf(o.x) === myPos ? 0.2 : 0) - rarePenalty(o.x);
+        var l = sung ? sung(o.x.word) : null;   // lyric bump, when the counts are loaded
+        var common = l == null ? 0.3 * popularity(freqOf(o.x)) : 0.15 * popularity(freqOf(o.x)) + 0.15 * l;
+        var score = 0.45 * o.rel + common + (strict[o.x.word] ? 0.25 : 0) + (myPos && posOf(o.x) === myPos ? 0.2 : 0) - rarePenalty(o.x);
         return { word: o.x.word, score: score, rare: !!rarePenalty(o.x) };
       })
       .sort(function (a, b) { return b.score - a.score; })
@@ -556,12 +583,161 @@
       .map(function (o) { return o.word; });
   }
 
-  /** Antonyms, best first: Datamuse's order counts a little, how common the word is counts more. */
-  function rankAntonyms(word, ants) {
-    return ants.map(function (x, i) { return { x: x, score: 0.25 * (1 - i / ants.length) + 0.75 * popularity(freqOf(x)) - rarePenalty(x) }; })
+  /** Antonyms, best first: Datamuse's order counts a little, how common the word is counts more,
+      and with sung(word) given (0 … 1, the lyric bump) how often it's sung counts too. */
+  function rankAntonyms(word, ants, sung) {
+    return ants.map(function (x, i) {
+      var l = sung ? sung(x.word) : null;
+      var common = l == null ? 0.75 * popularity(freqOf(x)) : 0.4 * popularity(freqOf(x)) + 0.35 * l;
+      return { x: x, score: 0.25 * (1 - i / ants.length) + common - rarePenalty(x) };
+    })
       .filter(function (o) { return usable(word)(o.x); })
       .sort(function (a, b) { return b.score - a.score; })
       .map(function (o) { return o.x.word; });
+  }
+
+  // ---------- Related words (Datamuse, the word sheet's Related tab) ----------
+  var RELATED_GROUPS = [
+    { id: 'describing', label: 'Describing words' },     // rel_jjb: adjectives used with a noun (ocean → deep, vast)
+    { id: 'describes', label: 'Things it describes' },   // rel_jja: nouns an adjective is used with (broken → heart, glass)
+    { id: 'next', label: 'Often next to' },              // lc / rc: words seen right after or before it (midnight → hour)
+    { id: 'world', label: 'Same world' },                // rel_trg: words that turn up with it (rain → thunder, mud)
+    { id: 'similes', label: 'Similes' },                 // sayings.js (Wiktionary): cold → cold as ice
+    { id: 'phrases', label: 'Phrases & sayings' }        // sayings.js (Wiktionary) idioms and proverbs, then Datamuse's
+                                                         // phrases if those are few (spark → spark plug). Last: Alex
+  ];
+  // Left out of Related on top of the grammar words: small words that go with anything (no, some,
+  // between, very, began…) and plain sizes and amounts (little, much, last). They crowd out the
+  // words a lyric can use.
+  var RELATED_SKIP = {};
+  ('no not nor any some all each every both either neither one two three four five ten first second ' +
+    'last next other another same such own only even ever never always often again still already ' +
+    'now then here there where when why how very too quite rather almost nearly just also yet else ' +
+    'more most less least much many few several enough little lot lots whole various certain ' +
+    'about above across after against along among around before behind below beneath beside between ' +
+    'beyond during except inside like near off out outside over past since through throughout till ' +
+    'toward towards under until up down within without away back once ' +
+    'get gets got getting take takes took taking make makes made making came come comes coming go goes ' +
+    'went going gone began begin having felt feel feels let put set say tell told seem seems ' +
+    'new latter former recent previous major minor general common national public certain particular ' +
+    'great good bad big small large high low long short real right left full non anti post pre ' +
+    'thing things way ways part kind sort type time times day year years man men people').split(' ')
+    .forEach(function (x) { RELATED_SKIP[x] = true; });
+  // Phrases: "one's" / "someone's" read as "your" (eat your heart out), and other forms of the same
+  // saying are shown once (have a heart of gold, had a heart of gold → heart of gold).
+  var PHRASE_YOUR = /\b(one's|someone's|somebody's|oneself)\b/g;
+  var PHRASE_ANY = /\b(your|my|his|her|their|our|one's|someone's|somebody's)\b/g;
+  /** Phrases, sayings and idioms with the word in them, best first: how often their words are sung
+      counts most (heart of gold before congestive heart failure), how common the phrase is counts
+      too. Phrases with a word the list doesn't know, or a name, are left out; so are rarely-sung ones. */
+  function relatedPhrases(dict, w, list) {
+    var has = new RegExp('(^| )' + w.replace(/[^a-z']/g, '') + '( |$)');
+    var seen = {}, out = [];
+    list.map(function (x, i) {
+      var p = x.word.replace(PHRASE_YOUR, 'your').replace(new RegExp('\\bones (?=' + w + ')'), 'your ');   // with all ones heart
+      if (!/^[a-z][a-z' -]*$/.test(p) || p.indexOf(' ') < 0 || p.split(' ').length > 7 || !has.test(p)) return null;
+      if (/^(a|an|the) [^ ]+$/.test(p)) return null;   // "the road" is no phrase
+      var parts = p.split(/[ -]+/).filter(function (q) { return q !== w && !GRAMMAR_WORDS[q]; });
+      if (!parts.every(function (q) { var j = find(dict, q); return j >= 0 && dict.real[j]; })) return null;
+      var l = lyricOf(dict, p);
+      if (l != null && l < 0.4) return null;   // rarely sung: medical, legal, technical (congestive heart failure)
+      return { p: p, score: 0.3 * popularity(freqOf(x)) + 0.6 * (l == null ? 0.5 : l) + 0.1 * (1 - i / list.length) };
+    }).filter(Boolean).sort(function (a, b) { return b.score - a.score; }).forEach(function (o) {
+      // One of each saying: as right as rain = be as right as rain = right as rain; burn / burning / burned
+      // the midnight oil; a bright spark = bright spark.
+      var key = o.p.replace(PHRASE_ANY, '·').replace(/^(to |be |have |has |had |having )+/, '').replace(/^(a|an|the|as) /, '')
+        .split(' ').map(function (q) { return q.replace(/(ing|ed|s)$/, '').replace(/e$/, '').replace(/(.)\1$/, '$1'); }).join(' ');
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push(o.p);
+    });
+    return out;
+  }
+  // ---------- Sayings and similes (sayings.js, from Wiktionary) ----------
+  /** Turns SW.SAYINGS into lists. */
+  function loadSayings(raw) {
+    return { sayings: raw && raw.sayings ? raw.sayings.split('|') : [], similes: raw && raw.similes ? raw.similes.split('|') : [] };
+  }
+  /** Idioms / proverbs and similes with the word (or its plural or -ed / -ing form) in them, best first:
+      ones whose words are often sung come first (heart of gold before heart balm), and 3–5 words before
+      two-word ones and long proverbs. Returns { sayings, similes }. */
+  function sayingsFor(dict, say, word) {
+    var w = clean(word), forms = {};
+    [w, w + 's', w + 'es', w + 'ed', w + 'd', w + 'ing', w.replace(/e$/, '') + 'ing', w.replace(/y$/, 'ies')]
+      .forEach(function (f) { forms[f] = true; });
+    function find_(list) {
+      return list.filter(function (p) {
+        return p.toLowerCase().split(/[^a-z']+/).some(function (x) { return forms[x]; });
+      }).map(function (p) {
+        var l = lyricOf(dict, p), n = p.split(' ').length;
+        var shape = n <= 2 ? 0.5 : n <= 5 ? 1 : n <= 7 ? 0.7 : 0.4;   // 3–5 words make the best hooks (heart of gold)
+        return { p: p, score: 0.6 * (l == null ? 0.5 : l) + 0.4 * shape };
+      }).sort(function (a, b) { return b.score - a.score; }).map(function (o) { return o.p; });
+    }
+    return { sayings: find_(say.sayings), similes: find_(say.similes) };
+  }
+
+  /** The Related tab's groups for a word, best first in each, each word in only one group.
+      me = Datamuse's own entry for the word (part of speech, its first tag = its main use);
+      a = { jjb, jja, after, before, trg, ml, pre, post, mid }, each a Datamuse answer list (asked
+      with md=pf; pre / post / mid = phrases with the word last, first or inside; any can be missing,
+      e.g. offline). say (optional) = loadSayings(SW.SAYINGS) for similes and sayings.
+      Datamuse's order counts most (it puts the telling words first: spark → electric, divine);
+      how common a word is, and how often it's sung (the lyric bump), count a little. Grammar words, small everyday words, names, odd
+      spellings and other forms of the word itself are left out; rare words come last.
+      Returns [{ id, label, words }] for the groups that have any words. */
+  function rankRelated(dict, word, me, a, say) {
+    var w = clean(word), tags = me && clean(me.word) === w ? me.tags || [] : [];
+    var main = tags.filter(function (t) { return /^(n|v|adj|adv)$/.test(t); })[0] || null;
+    var forms = {};
+    [w, w + 's', w + 'es', w + 'ed', w + 'd', w + 'ing', w.replace(/e$/, '') + 'ing', w + 'ly', w + 'ness',
+      w.replace(/s$/, ''), w.replace(/es$/, ''), w.replace(/ey$/, 'y'), w.replace(/y$/, 'ey')]
+      .forEach(function (f) { forms[f] = true; });
+    var inMl = {};
+    (a.ml || []).forEach(function (x) { inMl[x.word] = true; });
+    var shown = {};
+    var known = function (v) { return v.split(' ').every(function (p) { return find(dict, p) >= 0; }); };
+    function ok(x) {
+      var v = x.word;
+      if (forms[v] || GRAMMAR_WORDS[v] || RELATED_SKIP[v] || !/^[a-z][a-z' -]*$/.test(v)) return false;
+      var i = find(dict, v);
+      return !(i >= 0 && !dict.real[i]);   // names, foreign words, abbreviations
+    }
+    function rank(list, boost) {
+      list = (list || []).filter(ok);
+      var picked = list.map(function (x, i) {
+        var l = lyricOf(dict, x.word);   // lyric bump: words songs use move up (flame above capacitor)
+        var common = l == null ? 0.25 * popularity(freqOf(x)) : 0.1 * popularity(freqOf(x)) + 0.5 * l;
+        var score = (l == null ? 0.75 : 0.5) * (1 - i / list.length) + common + (boost && boost[x.word] ? 0.3 : 0)
+          - rarePenalty(x) - (known(x.word) ? 0 : 10);
+        return { word: x.word, score: score };
+      }).sort(function (p, q) { return q.score - p.score; });
+      var out = [];
+      picked.forEach(function (p) {
+        var v = p.word;
+        if (shown[v] || shown[v.replace(/s$/, '')] || shown[v.replace(/es$/, '')]) return;   // plugs after plug
+        shown[v] = true;
+        out.push(v);
+      });
+      return out;
+    }
+    var words = {
+      describing: !main || main === 'n' ? rank(a.jjb) : [],   // broken → "heart, sword" (as a noun) is no help
+      describes: main === 'adj' ? rank(a.jja) : []   // road → "side, building" (road as a describing word) is no help
+    };
+    var near = (a.after || []).concat(a.before || []).filter(function (x) { return (x.tags || []).indexOf('adv') < 0 || (x.tags || []).indexOf('n') >= 0; });
+    words.next = rank(near.sort(function (p, q) { return (q.score || 0) - (p.score || 0); }));
+    words.world = rank(a.trg, inMl);
+    // Sayings: Wiktionary's (offline) first; Datamuse's phrases only fill in when there are few.
+    var said = say ? sayingsFor(dict, say, w) : { sayings: [], similes: [] };
+    words.similes = said.similes;
+    var have = {};
+    said.sayings.forEach(function (p) { have[p.toLowerCase()] = true; });
+    var extra = said.sayings.length >= 8 ? [] : relatedPhrases(dict, w, (a.pre || []).concat(a.post || [], a.mid || []))
+      .filter(function (p) { return !have[p]; });
+    words.phrases = said.sayings.concat(extra);
+    return RELATED_GROUPS.map(function (g) { return { id: g.id, label: g.label, words: words[g.id] }; })
+      .filter(function (g) { return g.words.length; });
   }
 
   // ---------- Offline thesaurus (thesaurus.js) ----------
@@ -680,8 +856,8 @@
         var vul = th.vulgar[w] || (key === 'synonyms' && (g.vulgarAll || g.vulgarWords[w]));
         if (vul && !showVulgar) { if (!(w in score)) vulgarOnly[w] = true; return; }
         if (!(w in score)) { score[w] = 0; order.push(w); delete vulgarOnly[w]; }
-        var c = commonness(dict, w);
-        score[w] += Math.log2(g.used + 2) * c * c;
+        var c = commonness(dict, w), l = lyricOf(dict, w);
+        score[w] += Math.log2(g.used + 2) * c * c * (l == null ? 1 : 0.5 + l);   // lyric bump
       });
     });
     var words = order.map(function (w, i) { return { word: w, band: band(dict, w), s: score[w], i: i }; })
@@ -730,7 +906,7 @@
     encode: encode, decode: decode, tail: tail, compareTails: compareTails, tailScore: tailScore,
     load: load, clean: clean, find: find, syllables: syllables, rhymeType: rhymeType, rhymes: rhymes,
     respell: respell, pronunciations: pronunciations, tailsOf: tailsOf,
-    rankSynonyms: rankSynonyms, rankAntonyms: rankAntonyms,
+    rankSynonyms: rankSynonyms, rankAntonyms: rankAntonyms, addLyrics: addLyrics, lyricOf: lyricOf, rankRelated: rankRelated, RELATED_GROUPS: RELATED_GROUPS, loadSayings: loadSayings, sayingsFor: sayingsFor,
     lineWords: lineWords, wordSpans: wordSpans, lineSyllables: lineSyllables, rhymeScheme: rhymeScheme, lineRhyme: lineRhyme,
     loadThesaurus: loadThesaurus, baseWord: baseWord, loadDefinitions: loadDefinitions, definitions: definitions, meanings: meanings, isVulgar: isVulgar, band: band
   };

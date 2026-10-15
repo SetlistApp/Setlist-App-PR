@@ -305,7 +305,7 @@
   color: var(--sw-text); font: 600 16px var(--sw-body);   /* 16px, or iPhones zoom in when you tap it */
   -webkit-appearance: none; appearance: none;
 }
-.sw-seg.sw-4tabs button { padding: 7px 2px; font-size: 12.5px; }
+.sw-seg.sw-5tabs button { padding: 7px 1px; font-size: 12px; }
 /* Meaning tab */
 .sw-defs { margin-top: 6px; }
 .sw-def { padding: 12px 0; border-bottom: 1px solid var(--sw-line); }
@@ -440,16 +440,16 @@
   font-family: var(--sw-mono); font-size: 11px; font-weight: 500; display: flex; align-items: center; justify-content: center; color: var(--sw-bg);
 }
 .sw-lr.sw-none { background: transparent; }
-/* Rhyme colors: A gold, B green, C orange, D blue (then they repeat) */
-.sw-lr.sw-c1 { background: #e3a83b; } .sw-lr.sw-c2 { background: #4fae7a; } .sw-lr.sw-c3 { background: #d9704a; } .sw-lr.sw-c0 { background: #6fa3d8; }
-.sw-lr.sw-near { background: transparent; border: 1.5px dashed currentColor; }
-.sw-lr.sw-near.sw-c1 { color: #e3a83b; } .sw-lr.sw-near.sw-c2 { color: #4fae7a; } .sw-lr.sw-near.sw-c3 { color: #d9704a; } .sw-lr.sw-near.sw-c0 { color: #6fa3d8; }
-.sw-u { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
-.sw-u.sw-c1 { text-decoration-color: #e3a83b; } .sw-u.sw-c2 { text-decoration-color: #4fae7a; } .sw-u.sw-c3 { text-decoration-color: #d9704a; } .sw-u.sw-c0 { text-decoration-color: #6fa3d8; }
+/* Rhyme colors: A gold, B green, C orange, D blue, E purple, F pink (then they repeat; the letter
+   is always printed, so G still reads as G). Six since 2.0.8.2 (Alex). */
+.sw-k0 { --sw-rc: #e3a83b; } .sw-k1 { --sw-rc: #4fae7a; } .sw-k2 { --sw-rc: #d9704a; }
+.sw-k3 { --sw-rc: #6fa3d8; } .sw-k4 { --sw-rc: #a98be8; } .sw-k5 { --sw-rc: #e27fae; }
+.sw-lr[class*="sw-k"] { background: var(--sw-rc); }
+.sw-lr.sw-near { background: transparent; border: 1.5px dashed currentColor; color: var(--sw-rc); }
+.sw-u { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; text-decoration-color: var(--sw-rc); }
 .sw-u.sw-near { text-decoration-style: dashed; }
 .sw-u.sw-vowel { text-decoration-style: dotted; }
-.sw-lr.sw-vowel { background: transparent; border: 1.5px dotted currentColor; }
-.sw-lr.sw-vowel.sw-c1 { color: #e3a83b; } .sw-lr.sw-vowel.sw-c2 { color: #4fae7a; } .sw-lr.sw-vowel.sw-c3 { color: #d9704a; } .sw-lr.sw-vowel.sw-c0 { color: #6fa3d8; }
+.sw-lr.sw-vowel { background: transparent; border: 1.5px dotted currentColor; color: var(--sw-rc); }
 /* Tap the counts + letter to choose rhymes for a line */
 .sw-lg { display: flex; align-items: center; padding: 0 0 0 6px; flex-shrink: 0; }
 /* Rhyme letter picker */
@@ -498,12 +498,17 @@
   padding: 8px 12px; background: var(--sw-raised); border-bottom: 1px solid var(--sw-line);
 }
 .sw-wordbar[hidden] { display: none; }
+.sw-wword { display: flex; flex-direction: column; min-width: 0; line-height: 1.1; }   /* the word, its syllables under it */
 .sw-wordbar b { font-family: var(--sw-display); font-weight: 600; font-size: 17px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .sw-wordbar small { font-family: var(--sw-mono); font-size: 10px; color: var(--sw-dim); white-space: nowrap; }
-.sw-wbtns { margin-left: auto; display: flex; gap: 5px; flex-shrink: 0; }
+.sw-wbtns { margin-left: auto; display: flex; gap: 4px; flex-shrink: 0; }
+/* A word too long for one row (editor.js fitBar): the whole word on top, the buttons spread out below. */
+.sw-wordbar.sw-wrap { flex-wrap: wrap; row-gap: 6px; }
+.sw-wordbar.sw-wrap .sw-wword { flex-direction: row; align-items: baseline; gap: 8px; }
+.sw-wordbar.sw-wrap .sw-wbtns { width: 100%; margin-left: 0; justify-content: space-between; }
 .sw-wbtns .sw-wletter { color: var(--sw-gold); }
 .sw-wbtns button {
-  min-height: 34px; padding: 0 9px; border-radius: 8px; border: 1px solid var(--sw-line); background: var(--sw-surface);
+  min-height: 34px; padding: 0 7px; border-radius: 8px; border: 1px solid var(--sw-line); background: var(--sw-surface);
   font-family: var(--sw-display); font-weight: 600; font-size: 12.5px;
 }
 
@@ -524,10 +529,11 @@
 .sw-toast button { color: var(--sw-gold); font-family: var(--sw-display); font-weight: 600; font-size: 14px; }
 
 /* ---------- Lyrics page, plain-text look: no boxes, sections flow like a document ---------- */
+/* No gap between sections (Alex, 2.0.8.2): the section name alone separates them. */
 .sw-sec, .sw-sec.sw-editing, .sw-sec.sw-rep {
-  background: transparent; border: 0; border-radius: 0; box-shadow: none; padding: 0; margin: 0 0 22px;
+  background: transparent; border: 0; border-radius: 0; box-shadow: none; padding: 0; margin: 0;
 }
-.sw-sec.sw-editing { border-left: 2px solid var(--sw-gold); padding-left: 10px; margin-left: -12px; }
+/* Typing looks exactly like reading (Alex, 2.0.8.2): no edge, no Done button, same height. */
 .sw-sec .sw-tag, .sw-sec.sw-rep .sw-tag { background: transparent; padding: 0; min-height: 28px; border-radius: 0; }
 .sw-sec.sw-rep .sw-tag { color: var(--sw-dim); }
 .sw-sechd { margin-bottom: 2px; }
@@ -540,8 +546,29 @@
 .sw-lt { padding: 0; }
 .sw-lg { width: 56px; height: 25.6px; padding: 0; justify-content: flex-end; position: relative; }
 .sw-lg::before { content: ""; position: absolute; inset: -4px -6px -4px -10px; }   /* bigger tap area, same layout */
-.sw-ta { min-height: 77px; }
-.sw-done { background: transparent; color: var(--sw-gold); padding: 0 2px; min-height: 30px; }
+.sw-ta, .sw-mirror { padding: 2px 0 0; }   /* like .sw-lines: 2px on top, nothing below */
+.sw-ta { min-height: 34px; }   /* same as .sw-lines min-height, so short and empty sections keep their height */
+.sw-gl { margin-top: 0; }
+
+/* One text box for the whole song (2.0.8.2). The box's own letters are invisible; the mirror behind it,
+   laid out identically, draws the text: lyrics with rhyme underlines, "# Title" lines as gold bold
+   capitals without the "#", drawn over the invisible typed line, unless the cursor is on that line. */
+.sw-ta.sw-one { color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--sw-text); }
+.sw-ta.sw-one::placeholder { color: var(--sw-dim); -webkit-text-fill-color: var(--sw-dim); }
+.sw-ta.sw-one::selection { background: rgba(227, 168, 59, 0.32); }
+.sw-box .sw-mirror { color: var(--sw-text); }
+.sw-tl { color: var(--sw-gold); position: relative; }
+.sw-tlas { visibility: hidden; }   /* the title line as typed, keeping its room */
+.sw-tlcap {
+  position: absolute; left: 0; top: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  line-height: 25.6px;   /* centred in the line, like the section names before the one-box editor (.sw-tag) */
+  font-family: var(--sw-display); font-weight: 600; font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase;
+}
+.sw-gs {
+  position: absolute; right: 0; height: 25.6px; display: flex; align-items: center; white-space: nowrap;
+  font-family: var(--sw-mono); font-size: 11px; letter-spacing: 0.08em; color: var(--sw-dim); pointer-events: none;
+}
+.sw-nocounts .sw-gs { display: none; }
 .sw-addsec { width: auto; min-height: 40px; border: 0; padding: 0; text-align: left; }
 .sw-countbar { display: flex; justify-content: flex-end; margin: -6px 0 6px; }
 .sw-countbar .sw-switch { font-size: 12px; color: var(--sw-dim); }
